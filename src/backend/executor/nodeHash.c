@@ -57,9 +57,27 @@ static void ExecHashSkewTableInsert(HashJoinTable hashtable,
 static void ExecHashRemoveNextSkewBucket(HashJoinTable hashtable);
 
 static void *dense_alloc(HashJoinTable hashtable, Size size);
+static Size ExecHashLookupLayoutSize(HashJoinTable hashtable);
+static bool ExecHashSupportsAltLayout(HashState *state, int nbatch);
+static void ExecHashAltTableAlloc(HashJoinTable hashtable);
+static void ExecHashAltTableReset(HashJoinTable hashtable);
+static void ExecHashAltTableConvertToBuckets(HashJoinTable hashtable);
+static inline uint8 ExecHashAltH2(uint32 hashvalue);
+static inline int ExecHashAltStartSlot(HashJoinTable hashtable,
+										 uint32 hashvalue);
+static HashJoinAltSlotData *ExecHashAltFindSlot(HashJoinTable hashtable,
+													uint32 hashvalue,
+													bool *found,
+													bool for_insert);
+static bool ExecScanHashBucketCurrent(HashJoinState *hjstate,
+										 ExprContext *econtext,
+										 HashJoinTuple hashTuple,
+										 uint32 hashvalue);
+static bool ExecScanHashBucketAlt(HashJoinState *hjstate,
+									 ExprContext *econtext);
 static HashJoinTuple ExecParallelHashTupleAlloc(HashJoinTable hashtable,
-												size_t size,
-												dsa_pointer *shared);
+													size_t size,
+													dsa_pointer *shared);
 static void MultiExecPrivateHash(HashState *node);
 static void MultiExecParallelHash(HashState *node);
 static inline HashJoinTuple ExecParallelHashFirstTuple(HashJoinTable hashtable,
@@ -210,11 +228,12 @@ MultiExecPrivateHash(HashState *node)
 	}
 
 	/* resize the hash table if needed (NTUP_PER_BUCKET exceeded) */
-	if (hashtable->nbuckets != hashtable->nbuckets_optimal)
+	if (hashtable->lookup_layout == HJ_LOOKUP_CHAINED &&
+		hashtable->nbuckets != hashtable->nbuckets_optimal)
 		ExecHashIncreaseNumBuckets(hashtable);
 
-	/* Account for the buckets in spaceUsed (reported in EXPLAIN ANALYZE) */
-	hashtable->spaceUsed += hashtable->nbuckets * sizeof(HashJoinTuple);
+	/* Account for the lookup directory in spaceUsed (reported in EXPLAIN). */
+	hashtable->spaceUsed += ExecHashLookupLayoutSize(hashtable);
 	if (hashtable->spaceUsed > hashtable->spacePeak)
 		hashtable->spacePeak = hashtable->spaceUsed;
 
@@ -522,6 +541,10 @@ ExecHashTableCreate(HashState *state)
 	hashtable->log2_nbuckets = log2_nbuckets;
 	hashtable->log2_nbuckets_optimal = log2_nbuckets;
 	hashtable->buckets.unshared = NULL;
+	hashtable->lookup_layout = HJ_LOOKUP_CHAINED;
+	hashtable->alt.nslots = 0;
+	hashtable->alt.used_slots = 0;
+	hashtable->alt.slots = NULL;
 	hashtable->skewEnabled = false;
 	hashtable->skewBucket = NULL;
 	hashtable->skewBucketLen = 0;
@@ -652,7 +675,13 @@ ExecHashTableCreate(HashState *state)
 		 */
 		MemoryContextSwitchTo(hashtable->batchCxt);
 
-		hashtable->buckets.unshared = palloc0_array(HashJoinTuple, nbuckets);
+		if (ExecHashSupportsAltLayout(state, nbatch))
+		{
+			hashtable->lookup_layout = HJ_LOOKUP_ALT_SLOTS;
+			ExecHashAltTableAlloc(hashtable);
+		}
+		else
+			hashtable->buckets.unshared = palloc0_array(HashJoinTuple, nbuckets);
 
 		/*
 		 * Set up for skew optimization, if possible and there's a need for
@@ -1072,6 +1101,9 @@ ExecHashIncreaseNumBatches(HashJoinTable hashtable)
 	/* consider increasing size of the in-memory hash table instead */
 	if (ExecHashIncreaseBatchSize(hashtable))
 		return;
+
+	if (hashtable->lookup_layout == HJ_LOOKUP_ALT_SLOTS)
+		ExecHashAltTableConvertToBuckets(hashtable);
 
 	nbatch = oldnbatch * 2;
 	Assert(nbatch > 1);
@@ -1809,26 +1841,43 @@ ExecHashTableInsert(HashJoinTable hashtable,
 		 */
 		HeapTupleHeaderClearMatch(HJTUPLE_MINTUPLE(hashTuple));
 
-		/* Push it onto the front of the bucket's list */
-		hashTuple->next.unshared = hashtable->buckets.unshared[bucketno];
-		hashtable->buckets.unshared[bucketno] = hashTuple;
-
-		/*
-		 * Increase the (optimal) number of buckets if we just exceeded the
-		 * NTUP_PER_BUCKET threshold, but only when there's still a single
-		 * batch.  Note that totalTuples - skewTuples is a reliable indicator
-		 * of the hash table's size only as long as there's just one batch.
-		 */
-		if (hashtable->nbatch == 1 &&
-			(hashtable->totalTuples - hashtable->skewTuples) >
-			(hashtable->nbuckets_optimal * NTUP_PER_BUCKET))
+		if (hashtable->lookup_layout == HJ_LOOKUP_ALT_SLOTS)
 		{
-			/* Guard against integer overflow and alloc size overflow */
-			if (hashtable->nbuckets_optimal <= INT_MAX / 2 &&
-				hashtable->nbuckets_optimal * 2 <= MaxAllocSize / sizeof(HashJoinTuple))
+			HashJoinAltSlotData *slot;
+			bool		found;
+
+			slot = ExecHashAltFindSlot(hashtable, hashvalue, &found, true);
+			hashTuple->next.unshared = found ? slot->head : NULL;
+			slot->ctrl = HJ_ALT_SLOT_OCCUPIED;
+			slot->h2 = ExecHashAltH2(hashvalue);
+			slot->hashvalue = hashvalue;
+			slot->head = hashTuple;
+			if (!found)
+				hashtable->alt.used_slots++;
+		}
+		else
+		{
+			/* Push it onto the front of the bucket's list */
+			hashTuple->next.unshared = hashtable->buckets.unshared[bucketno];
+			hashtable->buckets.unshared[bucketno] = hashTuple;
+
+			/*
+			 * Increase the (optimal) number of buckets if we just exceeded the
+			 * NTUP_PER_BUCKET threshold, but only when there's still a single
+			 * batch.  Note that totalTuples - skewTuples is a reliable indicator
+			 * of the hash table's size only as long as there's just one batch.
+			 */
+			if (hashtable->nbatch == 1 &&
+				(hashtable->totalTuples - hashtable->skewTuples) >
+				(hashtable->nbuckets_optimal * NTUP_PER_BUCKET))
 			{
-				hashtable->nbuckets_optimal *= 2;
-				hashtable->log2_nbuckets_optimal += 1;
+				/* Guard against integer overflow and alloc size overflow */
+				if (hashtable->nbuckets_optimal <= INT_MAX / 2 &&
+					hashtable->nbuckets_optimal * 2 <= MaxAllocSize / sizeof(HashJoinTuple))
+				{
+					hashtable->nbuckets_optimal *= 2;
+					hashtable->log2_nbuckets_optimal += 1;
+				}
 			}
 		}
 
@@ -1837,9 +1886,13 @@ ExecHashTableInsert(HashJoinTable hashtable,
 		if (hashtable->spaceUsed > hashtable->spacePeak)
 			hashtable->spacePeak = hashtable->spaceUsed;
 		if (hashtable->spaceUsed +
-			hashtable->nbuckets_optimal * sizeof(HashJoinTuple)
+			ExecHashLookupLayoutSize(hashtable)
 			> hashtable->spaceAllowed)
+		{
+			if (hashtable->lookup_layout == HJ_LOOKUP_ALT_SLOTS)
+				ExecHashAltTableConvertToBuckets(hashtable);
 			ExecHashIncreaseNumBatches(hashtable);
+		}
 	}
 	else
 	{
@@ -2004,38 +2057,13 @@ ExecHashGetBucketAndBatch(HashJoinTable hashtable,
 	}
 }
 
-/*
- * ExecScanHashBucket
- *		scan a hash bucket for matches to the current outer tuple
- *
- * The current outer tuple must be stored in econtext->ecxt_outertuple.
- *
- * On success, the inner tuple is stored into hjstate->hj_CurTuple and
- * econtext->ecxt_innertuple, using hjstate->hj_HashTupleSlot as the slot
- * for the latter.
- */
-bool
-ExecScanHashBucket(HashJoinState *hjstate,
-				   ExprContext *econtext)
+static bool
+ExecScanHashBucketCurrent(HashJoinState *hjstate,
+							 ExprContext *econtext,
+							 HashJoinTuple hashTuple,
+							 uint32 hashvalue)
 {
 	ExprState  *hjclauses = hjstate->hashclauses;
-	HashJoinTable hashtable = hjstate->hj_HashTable;
-	HashJoinTuple hashTuple = hjstate->hj_CurTuple;
-	uint32		hashvalue = hjstate->hj_CurHashValue;
-
-	/*
-	 * hj_CurTuple is the address of the tuple last returned from the current
-	 * bucket, or NULL if it's time to start scanning a new bucket.
-	 *
-	 * If the tuple hashed to a skew bucket then scan the skew bucket
-	 * otherwise scan the standard hashtable bucket.
-	 */
-	if (hashTuple != NULL)
-		hashTuple = hashTuple->next.unshared;
-	else if (hjstate->hj_CurSkewBucketNo != INVALID_SKEW_BUCKET_NO)
-		hashTuple = hashtable->skewBucket[hjstate->hj_CurSkewBucketNo]->tuples;
-	else
-		hashTuple = hashtable->buckets.unshared[hjstate->hj_CurBucketNo];
 
 	while (hashTuple != NULL)
 	{
@@ -2059,10 +2087,68 @@ ExecScanHashBucket(HashJoinState *hjstate,
 		hashTuple = hashTuple->next.unshared;
 	}
 
-	/*
-	 * no match
-	 */
 	return false;
+}
+
+static bool
+ExecScanHashBucketAlt(HashJoinState *hjstate, ExprContext *econtext)
+{
+	HashJoinTable hashtable = hjstate->hj_HashTable;
+	HashJoinTuple hashTuple = hjstate->hj_CurTuple;
+	uint32		hashvalue = hjstate->hj_CurHashValue;
+
+	Assert(hashtable->lookup_layout == HJ_LOOKUP_ALT_SLOTS);
+
+	if (hashTuple != NULL)
+		hashTuple = hashTuple->next.unshared;
+	else
+	{
+		HashJoinAltSlotData *slot;
+		bool		found;
+
+		slot = ExecHashAltFindSlot(hashtable, hashvalue, &found, false);
+		hashTuple = found ? slot->head : NULL;
+	}
+
+	return ExecScanHashBucketCurrent(hjstate, econtext, hashTuple, hashvalue);
+}
+
+/*
+ * ExecScanHashBucket
+ *		scan a hash bucket for matches to the current outer tuple
+ *
+ * The current outer tuple must be stored in econtext->ecxt_outertuple.
+ *
+ * On success, the inner tuple is stored into hjstate->hj_CurTuple and
+ * econtext->ecxt_innertuple, using hjstate->hj_HashTupleSlot as the slot
+ * for the latter.
+ */
+bool
+ExecScanHashBucket(HashJoinState *hjstate,
+				   ExprContext *econtext)
+{
+	HashJoinTable hashtable = hjstate->hj_HashTable;
+	HashJoinTuple hashTuple = hjstate->hj_CurTuple;
+
+	/*
+	 * hj_CurTuple is the address of the tuple last returned from the current
+	 * bucket, or NULL if it's time to start scanning a new bucket.
+	 *
+	 * If the tuple hashed to a skew bucket then scan the skew bucket
+	 * otherwise scan the standard hashtable bucket.
+	 */
+	if (hashtable->lookup_layout == HJ_LOOKUP_ALT_SLOTS)
+		return ExecScanHashBucketAlt(hjstate, econtext);
+
+	if (hashTuple != NULL)
+		hashTuple = hashTuple->next.unshared;
+	else if (hjstate->hj_CurSkewBucketNo != INVALID_SKEW_BUCKET_NO)
+		hashTuple = hashtable->skewBucket[hjstate->hj_CurSkewBucketNo]->tuples;
+	else
+		hashTuple = hashtable->buckets.unshared[hjstate->hj_CurBucketNo];
+
+	return ExecScanHashBucketCurrent(hjstate, econtext, hashTuple,
+									 hjstate->hj_CurHashValue);
 }
 
 /*
@@ -2362,8 +2448,11 @@ ExecHashTableReset(HashJoinTable hashtable)
 	MemoryContextReset(hashtable->batchCxt);
 	oldcxt = MemoryContextSwitchTo(hashtable->batchCxt);
 
-	/* Reallocate and reinitialize the hash bucket headers. */
-	hashtable->buckets.unshared = palloc0_array(HashJoinTuple, nbuckets);
+	/* Reallocate and reinitialize the current lookup structure. */
+	if (hashtable->lookup_layout == HJ_LOOKUP_ALT_SLOTS)
+		ExecHashAltTableReset(hashtable);
+	else
+		hashtable->buckets.unshared = palloc0_array(HashJoinTuple, nbuckets);
 
 	hashtable->spaceUsed = 0;
 
@@ -3133,12 +3222,12 @@ ExecParallelHashTupleAlloc(HashJoinTable hashtable, size_t size,
 				LWLockRelease(&pstate->lock);
 
 				return NULL;
-			}
 		}
 	}
+}
 
-	/* We are cleared to allocate a new chunk. */
-	chunk_shared = dsa_allocate(hashtable->area, chunk_size);
+		/* We are cleared to allocate a new chunk. */
+		chunk_shared = dsa_allocate(hashtable->area, chunk_size);
 	hashtable->batches[curbatch].shared->size += chunk_size;
 	hashtable->batches[curbatch].at_least_one_chunk = true;
 
@@ -3171,6 +3260,151 @@ ExecParallelHashTupleAlloc(HashJoinTable hashtable, size_t size,
 	result = (HashJoinTuple) HASH_CHUNK_DATA(chunk);
 
 	return result;
+}
+
+static Size
+ExecHashLookupLayoutSize(HashJoinTable hashtable)
+{
+	if (hashtable->lookup_layout == HJ_LOOKUP_ALT_SLOTS)
+		return sizeof(HashJoinAltSlotData) * (Size) hashtable->alt.nslots;
+
+	return sizeof(HashJoinTuple) * (Size) hashtable->nbuckets;
+}
+
+static bool
+ExecHashSupportsAltLayout(HashState *state, int nbatch)
+{
+	Hash	   *node = (Hash *) state->ps.plan;
+
+	if (!state->enable_hashjoin_alt_table)
+		return false;
+
+	if (state->parallel_state != NULL)
+		return false;
+
+	if (nbatch != 1)
+		return false;
+
+	if (OidIsValid(node->skewTable))
+		return false;
+
+	return true;
+}
+
+static void
+ExecHashAltTableAlloc(HashJoinTable hashtable)
+{
+	Assert(hashtable->lookup_layout == HJ_LOOKUP_ALT_SLOTS);
+	Assert(hashtable->alt.nslots == 0);
+
+	if (hashtable->nbuckets <= INT_MAX / 2 &&
+		(Size) hashtable->nbuckets * 2 <= MaxAllocSize / sizeof(HashJoinAltSlotData))
+		hashtable->alt.nslots = hashtable->nbuckets * 2;
+	else
+		hashtable->alt.nslots = hashtable->nbuckets;
+	hashtable->alt.used_slots = 0;
+	hashtable->alt.slots = palloc0_array(HashJoinAltSlotData,
+										 hashtable->alt.nslots);
+}
+
+static void
+ExecHashAltTableReset(HashJoinTable hashtable)
+{
+	Assert(hashtable->lookup_layout == HJ_LOOKUP_ALT_SLOTS);
+
+	hashtable->alt.nslots = 0;
+	hashtable->alt.used_slots = 0;
+	hashtable->alt.slots = NULL;
+	ExecHashAltTableAlloc(hashtable);
+}
+
+static void
+ExecHashAltTableConvertToBuckets(HashJoinTable hashtable)
+{
+	HashJoinTuple *buckets;
+	int			i;
+	MemoryContext oldcxt;
+
+	if (hashtable->lookup_layout != HJ_LOOKUP_ALT_SLOTS)
+		return;
+
+	Assert(hashtable->parallel_state == NULL);
+
+	oldcxt = MemoryContextSwitchTo(hashtable->batchCxt);
+	buckets = palloc0_array(HashJoinTuple, hashtable->nbuckets);
+	MemoryContextSwitchTo(oldcxt);
+
+	for (i = 0; i < hashtable->alt.nslots; ++i)
+	{
+		HashJoinAltSlotData *slot = &hashtable->alt.slots[i];
+
+		if (slot->ctrl == HJ_ALT_SLOT_EMPTY)
+			continue;
+
+		buckets[slot->hashvalue & (hashtable->nbuckets - 1)] = slot->head;
+	}
+
+	hashtable->buckets.unshared = buckets;
+	hashtable->lookup_layout = HJ_LOOKUP_CHAINED;
+	hashtable->alt.nslots = 0;
+	hashtable->alt.used_slots = 0;
+	hashtable->alt.slots = NULL;
+}
+
+static inline uint8
+ExecHashAltH2(uint32 hashvalue)
+{
+	uint8		h2;
+
+	h2 = (uint8) (hashvalue >> 24);
+	if (h2 == HJ_ALT_SLOT_EMPTY)
+		h2 = 1;
+
+	return h2;
+}
+
+static inline int
+ExecHashAltStartSlot(HashJoinTable hashtable, uint32 hashvalue)
+{
+	return hashvalue & (hashtable->alt.nslots - 1);
+}
+
+static HashJoinAltSlotData *
+ExecHashAltFindSlot(HashJoinTable hashtable, uint32 hashvalue, bool *found,
+					bool for_insert)
+{
+	int			startslot = ExecHashAltStartSlot(hashtable, hashvalue);
+	int			slotno = startslot;
+	uint8		h2 = ExecHashAltH2(hashvalue);
+
+	Assert(hashtable->lookup_layout == HJ_LOOKUP_ALT_SLOTS);
+	Assert(hashtable->alt.nslots > 0);
+
+	for (;;)
+	{
+		HashJoinAltSlotData *slot = &hashtable->alt.slots[slotno];
+
+		if (slot->ctrl == HJ_ALT_SLOT_EMPTY)
+		{
+			*found = false;
+			return slot;
+		}
+
+		if (slot->h2 == h2 && slot->hashvalue == hashvalue)
+		{
+			*found = true;
+			return slot;
+		}
+
+		slotno = (slotno + 1) & (hashtable->alt.nslots - 1);
+		if (slotno == startslot)
+		{
+			*found = false;
+			if (for_insert)
+				elog(ERROR, "experimental hash join alternative slot table is full");
+			return NULL;
+		}
+	}
 }
 
 /*

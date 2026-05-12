@@ -164,6 +164,31 @@ typedef struct HashMemoryChunkData *HashMemoryChunk;
 /* tuples exceeding HASH_CHUNK_THRESHOLD bytes are put in their own chunk */
 #define HASH_CHUNK_THRESHOLD	(HASH_CHUNK_SIZE / 4)
 
+typedef enum HashJoinLookupLayout
+{
+	HJ_LOOKUP_CHAINED,
+	HJ_LOOKUP_ALT_SLOTS
+} HashJoinLookupLayout;
+
+#define HJ_ALT_SLOT_EMPTY	0
+#define HJ_ALT_SLOT_OCCUPIED	1
+
+typedef struct HashJoinAltSlotData
+{
+	uint8		ctrl;			/* empty vs occupied */
+	uint8		h2;				/* short hash fingerprint */
+	uint16		pad;
+	uint32		hashvalue;		/* full hash value */
+	HashJoinTuple head;			/* head of duplicate tuple chain */
+} HashJoinAltSlotData;
+
+typedef struct HashJoinAltTableData
+{
+	int			nslots;			/* power-of-two slot count */
+	int			used_slots;		/* occupied slot count */
+	HashJoinAltSlotData *slots;
+} HashJoinAltTableData;
+
 /*
  * For each batch of a Parallel Hash Join, we have a ParallelHashJoinBatch
  * object in shared memory to coordinate access to it.  Since they are
@@ -323,6 +348,9 @@ typedef struct HashJoinTableData
 		/* shared array is per-query DSA area, as are all the tuples */
 		dsa_pointer_atomic *shared;
 	}			buckets;
+
+	HashJoinLookupLayout lookup_layout;	/* candidate lookup structure */
+	HashJoinAltTableData alt;			/* experimental serial one-batch path */
 
 	bool		skewEnabled;	/* are we using skew optimization? */
 	HashSkewBucket **skewBucket;	/* hashtable of skew buckets */

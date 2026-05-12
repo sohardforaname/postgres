@@ -2693,6 +2693,7 @@ typedef struct HashState
 	PlanState	ps;				/* its first field is NodeTag */
 	HashJoinTable hashtable;	/* hash table for the hashjoin */
 	ExprState  *hash_expr;		/* ExprState to get hash value */
+	bool		enable_hashjoin_alt_table;	/* experimental serial one-batch path */
 
 	FmgrInfo   *skew_hashfunction;	/* lookup data for skew hash function */
 	Oid			skew_collation; /* collation to call skew_hashfunction with */

@@ -170,6 +170,7 @@
 #include "executor/nodeHash.h"
 #include "executor/nodeHashjoin.h"
 #include "miscadmin.h"
+#include "optimizer/cost.h"
 #include "utils/lsyscache.h"
 #include "utils/sharedtuplestore.h"
 #include "utils/tuplestore.h"
@@ -1002,12 +1003,15 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 								&hashstate->ps,
 								0);
 
-		/* Remember whether we need to save tuples with null join keys */
-		hjstate->hj_KeepNullTuples = HJ_FILL_OUTER(hjstate);
-		hashstate->keep_null_tuples = HJ_FILL_INNER(hjstate);
+			/* Remember whether we need to save tuples with null join keys */
+			hjstate->hj_KeepNullTuples = HJ_FILL_OUTER(hjstate);
+			hashstate->keep_null_tuples = HJ_FILL_INNER(hjstate);
+			hashstate->enable_hashjoin_alt_table =
+				enable_hashjoin_alt_table &&
+				!HJ_FILL_INNER(hjstate);
 
-		/*
-		 * Set up the skew table hash function while we have a record of the
+			/*
+			 * Set up the skew table hash function while we have a record of the
 		 * first key's hash function Oid.
 		 */
 		if (OidIsValid(hash->skewTable))
