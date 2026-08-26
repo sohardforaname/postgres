@@ -1,0 +1,26 @@
+CREATE FUNCTION repeat_bench()
+RETURNS TABLE (source text,
+			   repeats int,
+			   output text,
+			   master text,
+			   doubling text,
+			   nocap text,
+			   cap512 text,
+			   cap1k text,
+			   cap2k text,
+			   cap4k text,
+			   cap8k text,
+			   cap16k text,
+			   cap32k text,
+			   cap64k text,
+			   cap128k text,
+			   cap256k text,
+			   cap512k text,
+			   cap1m text,
+			   cap2m text,
+			   cap4m text,
+			   cap8m text,
+			   cap16m text,
+    		   fastest text)
+AS 'MODULE_PATHNAME', 'repeat_bench'
+LANGUAGE C STRICT VOLATILE;

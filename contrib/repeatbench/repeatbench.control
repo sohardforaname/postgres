@@ -1,0 +1,4 @@
+comment = 'verify candidate repeat() copy strategies'
+default_version = '1.0'
+module_pathname = '$libdir/repeatbench'
+relocatable = true
