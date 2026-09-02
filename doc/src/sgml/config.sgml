@@ -5983,6 +5983,20 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-enable-hashjoin-keycache" xreflabel="enable_hashjoin_keycache">
+      <term><varname>enable_hashjoin_keycache</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>enable_hashjoin_keycache</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Enables or disables the executor's key cache optimization for eligible
+        hash joins. The default is <literal>on</literal>.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-enable-incremental-sort" xreflabel="enable_incremental_sort">
       <term><varname>enable_incremental_sort</varname> (<type>boolean</type>)
       <indexterm>

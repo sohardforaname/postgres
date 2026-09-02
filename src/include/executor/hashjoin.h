@@ -27,10 +27,12 @@
  *
  * Each active hashjoin has a HashJoinTable structure, which is
  * palloc'd in the executor's per-query context.  Other storage needed for
- * each hashjoin is kept in child contexts, three for each hashjoin:
+ * each hashjoin is kept in child contexts, including the optional serial
+ * key cache:
  *   - HashTableContext (hashCxt): the parent hash table storage context
  *   - HashSpillContext (spillCxt): storage for temp files buffers
  *   - HashBatchContext (batchCxt): storage for a batch in serial hash join
+ *   - HashKeyCacheContext (keycacheCxt): storage for the serial key cache
  *
  * The hashtable contexts are made children of the per-query context, ensuring
  * that they will be discarded at end of statement even if the join is
@@ -84,6 +86,7 @@
 
 /* these are in nodes/execnodes.h: */
 /* typedef struct HashJoinTupleData *HashJoinTuple; */
+/* typedef struct HashJoinKeyCacheData *HashJoinKeyCache; */
 /* typedef struct HashJoinTableData *HashJoinTable; */
 
 typedef struct HashJoinTupleData
@@ -101,6 +104,17 @@ typedef struct HashJoinTupleData
 #define HJTUPLE_OVERHEAD  MAXALIGN(sizeof(HashJoinTupleData))
 #define HJTUPLE_MINTUPLE(hjtup)  \
 	((MinimalTuple) ((char *) (hjtup) + HJTUPLE_OVERHEAD))
+
+/*
+ * Serial-only cache entry used to compare simple keys before touching the
+ * full hash-join tuple.  The tuple pointer refers to the regular hash chain.
+ */
+struct HashJoinKeyCacheData
+{
+	struct HashJoinKeyCacheData *next;
+	Datum		key;
+	HashJoinTuple tuple;
+};
 
 /*
  * If the outer relation's distribution is sufficiently nonuniform, we attempt
@@ -368,9 +382,13 @@ typedef struct HashJoinTableData
 	MemoryContext hashCxt;		/* context for whole-hash-join storage */
 	MemoryContext batchCxt;		/* context for this-batch-only storage */
 	MemoryContext spillCxt;		/* context for spilling to temp files */
+	MemoryContext keycacheCxt;	/* context for the serial key cache */
 
 	/* used for dense allocation of tuples (into linked chunks) */
 	HashMemoryChunk chunks;		/* one list for the whole batch */
+	HashJoinKeyCache *keycacheBuckets;
+	AttrNumber	keycacheAttno;	/* inner-side attribute for key cache */
+	Size		keycacheSpace;	/* space used by key cache entries */
 
 	/* Shared and private state for Parallel Hash. */
 	HashMemoryChunk current_chunk;	/* this backend's current chunk */

@@ -2243,6 +2243,7 @@ typedef struct MergeJoinState
 
 /* these structs are defined in executor/hashjoin.h: */
 typedef struct HashJoinTupleData *HashJoinTuple;
+typedef struct HashJoinKeyCacheData *HashJoinKeyCache;
 typedef struct HashJoinTableData *HashJoinTable;
 
 typedef struct HashJoinState
@@ -2255,6 +2256,11 @@ typedef struct HashJoinState
 	int			hj_CurBucketNo;
 	int			hj_CurSkewBucketNo;
 	HashJoinTuple hj_CurTuple;
+	HashJoinKeyCache hj_CurKeyCache;
+	Datum		hj_OuterHashKey;
+	FmgrInfo	hj_FastEqual;
+	Oid			hj_FastCollation;
+	AttrNumber	hj_OuterKeyAttno;
 	TupleTableSlot *hj_OuterTupleSlot;
 	TupleTableSlot *hj_HashTupleSlot;
 	TupleTableSlot *hj_NullOuterTupleSlot;
@@ -2693,6 +2699,8 @@ typedef struct HashState
 	PlanState	ps;				/* its first field is NodeTag */
 	HashJoinTable hashtable;	/* hash table for the hashjoin */
 	ExprState  *hash_expr;		/* ExprState to get hash value */
+	bool		fastpath;		/* use compact entries for a simple hash key */
+	AttrNumber	hashkey_attno;	/* inner-side attribute for fastpath */
 
 	FmgrInfo   *skew_hashfunction;	/* lookup data for skew hash function */
 	Oid			skew_collation; /* collation to call skew_hashfunction with */

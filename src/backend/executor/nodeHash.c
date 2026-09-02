@@ -36,6 +36,7 @@
 #include "executor/nodeHash.h"
 #include "executor/nodeHashjoin.h"
 #include "miscadmin.h"
+#include "optimizer/cost.h"
 #include "port/pg_bitutils.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -57,6 +58,11 @@ static void ExecHashSkewTableInsert(HashJoinTable hashtable,
 static void ExecHashRemoveNextSkewBucket(HashJoinTable hashtable);
 
 static void *dense_alloc(HashJoinTable hashtable, Size size);
+static void ExecHashKeyCacheInsert(HashJoinTable hashtable,
+										TupleTableSlot *slot,
+										HashJoinTuple tuple);
+static void ExecHashKeyCacheResize(HashJoinTable hashtable, int oldnbuckets);
+static void ExecHashKeyCacheDisable(HashJoinTable hashtable);
 static HashJoinTuple ExecParallelHashTupleAlloc(HashJoinTable hashtable,
 												size_t size,
 												dsa_pointer *shared);
@@ -80,6 +86,28 @@ static bool ExecParallelHashTuplePrealloc(HashJoinTable hashtable,
 										  size_t size);
 static void ExecParallelHashMergeCounters(HashJoinTable hashtable);
 static void ExecParallelHashCloseBatchAccessors(HashJoinTable hashtable);
+
+/*
+ * Call the built-in equality operator directly.  Fast-path callers have
+ * already checked that both pass-by-value keys are non-NULL.
+ */
+static inline bool
+ExecHashJoinFastCompare(HashJoinState *hjstate, Datum outer_key,
+							Datum inner_key)
+{
+	LOCAL_FCINFO(fcinfo, 2);
+	Datum		result;
+
+	InitFunctionCallInfoData(*fcinfo, &hjstate->hj_FastEqual, 2,
+							hjstate->hj_FastCollation, NULL, NULL);
+	fcinfo->args[0].value = outer_key;
+	fcinfo->args[0].isnull = false;
+	fcinfo->args[1].value = inner_key;
+	fcinfo->args[1].isnull = false;
+
+	result = hjstate->hj_FastEqual.fn_addr(fcinfo);
+	return !fcinfo->isnull && DatumGetBool(result);
+}
 
 
 /* ----------------------------------------------------------------
@@ -412,6 +440,8 @@ ExecInitHash(Hash *node, EState *estate, int eflags)
 	hashstate->ps.ExecProcNode = ExecHash;
 	/* delay building hashtable until ExecHashTableCreate() in executor run */
 	hashstate->hashtable = NULL;
+	hashstate->fastpath = false;
+	hashstate->hashkey_attno = InvalidAttrNumber;
 
 	/*
 	 * Miscellaneous initialization
@@ -479,6 +509,7 @@ ExecHashTableCreate(HashState *state)
 	double		rows;
 	int			num_skew_mcvs;
 	int			log2_nbuckets;
+	bool			fastpath;
 	MemoryContext oldcxt;
 
 	/*
@@ -495,6 +526,8 @@ ExecHashTableCreate(HashState *state)
 	 * total number of rows across all copies of the partial plan.
 	 */
 	rows = node->plan.parallel_aware ? node->rows_total : outerNode->plan_rows;
+	fastpath = enable_hashjoin_keycache &&
+		state->fastpath && state->parallel_state == NULL;
 
 	ExecChooseHashTableSize(rows, outerNode->plan_width,
 							OidIsValid(node->skewTable),
@@ -503,6 +536,8 @@ ExecHashTableCreate(HashState *state)
 							state->parallel_state->nparticipants - 1 : 0,
 							&space_allowed,
 							&nbuckets, &nbatch, &num_skew_mcvs);
+	if (nbatch > 1)
+		fastpath = false;
 
 	/* nbuckets must be a power of 2 */
 	log2_nbuckets = pg_ceil_log2_32(nbuckets);
@@ -544,6 +579,8 @@ ExecHashTableCreate(HashState *state)
 	hashtable->spaceAllowedSkew =
 		hashtable->spaceAllowed * SKEW_HASH_MEM_PERCENT / 100;
 	hashtable->chunks = NULL;
+	hashtable->keycacheAttno = state->hashkey_attno;
+	hashtable->keycacheSpace = 0;
 	hashtable->current_chunk = NULL;
 	hashtable->parallel_state = state->parallel_state;
 	hashtable->area = state->ps.state->es_query_dsa;
@@ -569,6 +606,19 @@ ExecHashTableCreate(HashState *state)
 	hashtable->spillCxt = AllocSetContextCreate(hashtable->hashCxt,
 												"HashSpillContext",
 												ALLOCSET_DEFAULT_SIZES);
+	if (fastpath)
+	{
+		hashtable->keycacheCxt = AllocSetContextCreate(hashtable->hashCxt,
+											"HashKeyCacheContext",
+											ALLOCSET_DEFAULT_SIZES);
+		hashtable->keycacheBuckets = MemoryContextAllocZero(hashtable->keycacheCxt,
+																 nbuckets * sizeof(HashJoinKeyCache));
+	}
+	else
+	{
+		hashtable->keycacheCxt = NULL;
+		hashtable->keycacheBuckets = NULL;
+	}
 
 	/* Allocate data that will live for the life of the hashjoin */
 
@@ -1075,6 +1125,7 @@ ExecHashIncreaseNumBatches(HashJoinTable hashtable)
 
 	nbatch = oldnbatch * 2;
 	Assert(nbatch > 1);
+	ExecHashKeyCacheDisable(hashtable);
 
 #ifdef HJDEBUG
 	printf("Hashjoin %p: increasing nbatch to %d because space = %zu\n",
@@ -1482,8 +1533,8 @@ ExecParallelHashRepartitionFirst(HashJoinTable hashtable)
 				/* It still belongs in batch 0.  Copy to a new chunk. */
 				copyTuple =
 					ExecParallelHashTupleAlloc(hashtable,
-											   HJTUPLE_OVERHEAD + tuple->t_len,
-											   &shared);
+														   HJTUPLE_OVERHEAD + tuple->t_len,
+														   &shared);
 				copyTuple->hashvalue = hashTuple->hashvalue;
 				memcpy(HJTUPLE_MINTUPLE(copyTuple), tuple, tuple->t_len);
 				ExecParallelHashPushTuple(&hashtable->buckets.shared[bucketno],
@@ -1612,6 +1663,7 @@ static void
 ExecHashIncreaseNumBuckets(HashJoinTable hashtable)
 {
 	HashMemoryChunk chunk;
+	int			oldnbuckets;
 
 	/* do nothing if not an increase (it's called increase for a reason) */
 	if (hashtable->nbuckets >= hashtable->nbuckets_optimal)
@@ -1621,6 +1673,7 @@ ExecHashIncreaseNumBuckets(HashJoinTable hashtable)
 	printf("Hashjoin %p: increasing nbuckets %d => %d\n",
 		   hashtable, hashtable->nbuckets, hashtable->nbuckets_optimal);
 #endif
+	oldnbuckets = hashtable->nbuckets;
 
 	hashtable->nbuckets = hashtable->nbuckets_optimal;
 	hashtable->log2_nbuckets = hashtable->log2_nbuckets_optimal;
@@ -1641,6 +1694,8 @@ ExecHashIncreaseNumBuckets(HashJoinTable hashtable)
 
 	memset(hashtable->buckets.unshared, 0,
 		   hashtable->nbuckets * sizeof(HashJoinTuple));
+	if (hashtable->keycacheBuckets != NULL)
+		ExecHashKeyCacheResize(hashtable, oldnbuckets);
 
 	/* scan through all tuples in all chunks to rebuild the hash table */
 	for (chunk = hashtable->chunks; chunk != NULL; chunk = chunk->next.unshared)
@@ -1748,7 +1803,7 @@ ExecParallelHashIncreaseNumBuckets(HashJoinTable hashtable)
 
 					/* advance index past the tuple */
 					idx += MAXALIGN(HJTUPLE_OVERHEAD +
-									HJTUPLE_MINTUPLE(hashTuple)->t_len);
+								HJTUPLE_MINTUPLE(hashTuple)->t_len);
 				}
 
 				/* allow this loop to be cancellable */
@@ -1812,6 +1867,8 @@ ExecHashTableInsert(HashJoinTable hashtable,
 		/* Push it onto the front of the bucket's list */
 		hashTuple->next.unshared = hashtable->buckets.unshared[bucketno];
 		hashtable->buckets.unshared[bucketno] = hashTuple;
+		if (hashtable->keycacheBuckets != NULL)
+			ExecHashKeyCacheInsert(hashtable, slot, hashTuple);
 
 		/*
 		 * Increase the (optimal) number of buckets if we just exceeded the
@@ -2022,6 +2079,37 @@ ExecScanHashBucket(HashJoinState *hjstate,
 	HashJoinTable hashtable = hjstate->hj_HashTable;
 	HashJoinTuple hashTuple = hjstate->hj_CurTuple;
 	uint32		hashvalue = hjstate->hj_CurHashValue;
+
+	if (hashtable->keycacheBuckets != NULL)
+	{
+		HashJoinKeyCache keycache = hjstate->hj_CurKeyCache;
+
+		if (keycache != NULL)
+			keycache = keycache->next;
+		else
+			keycache = hashtable->keycacheBuckets[hjstate->hj_CurBucketNo];
+
+		while (keycache != NULL)
+		{
+			if (ExecHashJoinFastCompare(hjstate, hjstate->hj_OuterHashKey,
+										keycache->key))
+			{
+				hashTuple = keycache->tuple;
+				/* insert hashtable's tuple into exec slot */
+				ExecStoreMinimalTuple(HJTUPLE_MINTUPLE(hashTuple),
+										  hjstate->hj_HashTupleSlot,
+										  false);
+				econtext->ecxt_innertuple = hjstate->hj_HashTupleSlot;
+				hjstate->hj_CurKeyCache = keycache;
+				hjstate->hj_CurTuple = hashTuple;
+				return true;
+			}
+
+			keycache = keycache->next;
+		}
+
+		return false;
+	}
 
 	/*
 	 * hj_CurTuple is the address of the tuple last returned from the current
@@ -2637,7 +2725,7 @@ ExecHashSkewTableInsert(HashJoinTable hashtable,
 	/* Create the HashJoinTuple */
 	hashTupleSize = HJTUPLE_OVERHEAD + tuple->t_len;
 	hashTuple = (HashJoinTuple) MemoryContextAlloc(hashtable->batchCxt,
-												   hashTupleSize);
+														   hashTupleSize);
 	hashTuple->hashvalue = hashvalue;
 	memcpy(HJTUPLE_MINTUPLE(hashTuple), tuple, tuple->t_len);
 	HeapTupleHeaderClearMatch(HJTUPLE_MINTUPLE(hashTuple));
@@ -2945,6 +3033,76 @@ ExecHashAccumInstrumentation(HashInstrumentation *instrument,
 									  hashtable->nbatch_original);
 	instrument->space_peak = Max(instrument->space_peak,
 								 hashtable->spacePeak);
+}
+
+/* Add a simple inner key and a reference to the regular hash-chain tuple. */
+static void
+ExecHashKeyCacheInsert(HashJoinTable hashtable, TupleTableSlot *slot,
+						   HashJoinTuple tuple)
+{
+	HashJoinKeyCache keycache;
+	bool		isnull;
+	int			bucketno;
+
+	keycache = MemoryContextAlloc(hashtable->keycacheCxt,
+								  sizeof(*keycache));
+	keycache->key = slot_getattr(slot, hashtable->keycacheAttno, &isnull);
+	Assert(!isnull);
+	keycache->tuple = tuple;
+	bucketno = tuple->hashvalue & (hashtable->nbuckets - 1);
+	keycache->next = hashtable->keycacheBuckets[bucketno];
+	hashtable->keycacheBuckets[bucketno] = keycache;
+	hashtable->keycacheSpace += sizeof(*keycache);
+	hashtable->spaceUsed += sizeof(*keycache);
+	if (hashtable->spaceUsed > hashtable->spacePeak)
+		hashtable->spacePeak = hashtable->spaceUsed;
+}
+
+/* Rebuild the key cache after the regular hash table grows its buckets. */
+static void
+ExecHashKeyCacheResize(HashJoinTable hashtable, int oldnbuckets)
+{
+	HashJoinKeyCache *oldbuckets = hashtable->keycacheBuckets;
+	HashJoinKeyCache *newbuckets;
+	MemoryContext oldcxt;
+	int			i;
+
+	oldcxt = MemoryContextSwitchTo(hashtable->keycacheCxt);
+	newbuckets = palloc0_array(HashJoinKeyCache, hashtable->nbuckets);
+
+	for (i = 0; i < oldnbuckets; i++)
+	{
+		HashJoinKeyCache keycache = oldbuckets[i];
+
+		while (keycache != NULL)
+		{
+			HashJoinKeyCache next = keycache->next;
+			int			bucketno;
+
+			bucketno = keycache->tuple->hashvalue & (hashtable->nbuckets - 1);
+			keycache->next = newbuckets[bucketno];
+			newbuckets[bucketno] = keycache;
+			keycache = next;
+		}
+	}
+
+	pfree(oldbuckets);
+	hashtable->keycacheBuckets = newbuckets;
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/* Drop the cache before the regular hash table starts spilling. */
+static void
+ExecHashKeyCacheDisable(HashJoinTable hashtable)
+{
+	if (hashtable->keycacheCxt != NULL)
+	{
+		hashtable->spaceUsed -= hashtable->keycacheSpace;
+		hashtable->keycacheSpace = 0;
+		MemoryContextDelete(hashtable->keycacheCxt);
+		hashtable->keycacheCxt = NULL;
+		hashtable->keycacheBuckets = NULL;
+	}
 }
 
 /*

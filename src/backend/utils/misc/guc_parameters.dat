@@ -926,6 +926,13 @@
   boot_val => 'true',
 },
 
+{ name => 'enable_hashjoin_keycache', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Enables the HashJoin key cache optimization.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'enable_hashjoin_keycache',
+  boot_val => 'true',
+},
+
 { name => 'enable_incremental_sort', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
   short_desc => 'Enables the planner\'s use of incremental sort steps.',
   flags => 'GUC_EXPLAIN',

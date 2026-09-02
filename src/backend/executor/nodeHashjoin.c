@@ -164,12 +164,15 @@
 
 #include "access/htup_details.h"
 #include "access/parallel.h"
+#include "catalog/pg_proc.h"
 #include "executor/executor.h"
 #include "executor/hashjoin.h"
 #include "executor/instrument.h"
 #include "executor/nodeHash.h"
 #include "executor/nodeHashjoin.h"
 #include "miscadmin.h"
+#include "pgstat.h"
+#include "utils/fmgrtab.h"
 #include "utils/lsyscache.h"
 #include "utils/sharedtuplestore.h"
 #include "utils/tuplestore.h"
@@ -206,6 +209,84 @@ static TupleTableSlot *ExecHashJoinGetSavedTuple(HashJoinState *hjstate,
 static bool ExecHashJoinNewBatch(HashJoinState *hjstate);
 static bool ExecParallelHashJoinNewBatch(HashJoinState *hjstate);
 static void ExecParallelHashJoinPartitionOuter(HashJoinState *hjstate);
+static bool ExecHashJoinInitializeFastPath(HashJoinState *hjstate,
+									   HashJoin *node,
+									   TupleDesc outerDesc,
+									   TupleDesc innerDesc,
+									   HashState *hashstate);
+
+/*
+ * Recognize the deliberately small subset for which the hash value and the
+ * original hash clause are both represented by a single pass-by-value Var.
+ * Keeping this check here makes the optimization executor-local and leaves
+ * plan creation and all less common hash join forms untouched.
+ */
+static bool
+ExecHashJoinInitializeFastPath(HashJoinState *hjstate, HashJoin *node,
+							   TupleDesc outerDesc, TupleDesc innerDesc,
+							   HashState *hashstate)
+{
+	OpExpr		*clause;
+	Node		*outer_expr;
+	Node		*inner_expr;
+	Var		*outer_var;
+	Var		*inner_var;
+	int16		outer_typlen;
+	int16		inner_typlen;
+	bool		outer_typbyval;
+	bool		inner_typbyval;
+
+	if (list_length(node->hashclauses) != 1 ||
+		list_length(node->hashoperators) != 1 ||
+		list_length(node->hashkeys) != 1)
+		return false;
+
+	if (!IsA(linitial(node->hashclauses), OpExpr))
+		return false;
+	clause = linitial_node(OpExpr, node->hashclauses);
+	if (list_length(clause->args) != 2 || clause->opretset ||
+		clause->opresulttype != BOOLOID || !op_strict(clause->opno) ||
+		func_volatile(clause->opfuncid) != PROVOLATILE_IMMUTABLE)
+		return false;
+
+	outer_expr = linitial(clause->args);
+	inner_expr = lsecond(clause->args);
+	if (IsA(outer_expr, RelabelType))
+		outer_expr = (Node *) ((RelabelType *) outer_expr)->arg;
+	if (IsA(inner_expr, RelabelType))
+		inner_expr = (Node *) ((RelabelType *) inner_expr)->arg;
+	if (!IsA(outer_expr, Var) || !IsA(inner_expr, Var))
+		return false;
+
+	outer_var = (Var *) outer_expr;
+	inner_var = (Var *) inner_expr;
+	if (outer_var->varno != OUTER_VAR || inner_var->varno != INNER_VAR ||
+		outer_var->varlevelsup != 0 || inner_var->varlevelsup != 0 ||
+		outer_var->varattno < 1 || outer_var->varattno > outerDesc->natts ||
+		inner_var->varattno < 1 || inner_var->varattno > innerDesc->natts)
+		return false;
+
+	/* Keep the inner key in the chain entry, so require small Datums. */
+	get_typlenbyval(outer_var->vartype, &outer_typlen, &outer_typbyval);
+	get_typlenbyval(inner_var->vartype, &inner_typlen, &inner_typbyval);
+	if (!outer_typbyval || outer_typlen <= 0 ||
+		outer_typlen > (int16) sizeof(Datum) ||
+		!inner_typbyval || inner_typlen <= 0 ||
+		inner_typlen > (int16) sizeof(Datum))
+		return false;
+
+	/* Only functions in the built-in table are safe to call directly. */
+	if (clause->opfuncid > fmgr_last_builtin_oid ||
+		fmgr_builtin_oid_index[clause->opfuncid] == InvalidOidBuiltinMapping)
+		return false;
+	fmgr_info(clause->opfuncid, &hjstate->hj_FastEqual);
+
+	hjstate->hj_FastCollation = clause->inputcollid;
+	hjstate->hj_OuterKeyAttno = outer_var->varattno;
+	hashstate->fastpath = true;
+	hashstate->hashkey_attno = inner_var->varattno;
+	return true;
+}
 
 
 /* ----------------------------------------------------------------
@@ -488,6 +569,15 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 
 				econtext->ecxt_outertuple = outerTupleSlot;
 				node->hj_MatchedOuter = false;
+				if (hashtable->keycacheBuckets != NULL)
+				{
+					bool		isnull;
+
+					node->hj_OuterHashKey = slot_getattr(outerTupleSlot,
+													 node->hj_OuterKeyAttno,
+													 &isnull);
+					Assert(!isnull);
+				}
 
 				/*
 				 * Find the corresponding bucket for this tuple in the main
@@ -499,6 +589,7 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 				node->hj_CurSkewBucketNo = ExecHashGetSkewBucket(hashtable,
 																 hashvalue);
 				node->hj_CurTuple = NULL;
+				node->hj_CurKeyCache = NULL;
 
 				/*
 				 * The tuple might not belong to the current batch (where
@@ -946,6 +1037,7 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 
 
 		hjstate->hj_HashTupleSlot = slot;
+		hjstate->hj_OuterKeyAttno = InvalidAttrNumber;
 
 		/*
 		 * Build ExprStates to obtain hash values for either side of the join.
@@ -954,6 +1046,8 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 		 * to the correct PlanState.
 		 */
 		nkeys = list_length(node->hashoperators);
+		(void) ExecHashJoinInitializeFastPath(hjstate, node, outerDesc,
+										  innerDesc, hashstate);
 
 		outer_hashfuncid = palloc_array(Oid, nkeys);
 		inner_hashfuncid = palloc_array(Oid, nkeys);
@@ -1044,6 +1138,7 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 	hjstate->hj_CurBucketNo = 0;
 	hjstate->hj_CurSkewBucketNo = INVALID_SKEW_BUCKET_NO;
 	hjstate->hj_CurTuple = NULL;
+	hjstate->hj_CurKeyCache = NULL;
 
 	hjstate->hj_JoinState = HJ_BUILD_HASHTABLE;
 	hjstate->hj_MatchedOuter = false;
@@ -1751,6 +1846,7 @@ ExecReScanHashJoin(HashJoinState *node)
 	node->hj_CurBucketNo = 0;
 	node->hj_CurSkewBucketNo = INVALID_SKEW_BUCKET_NO;
 	node->hj_CurTuple = NULL;
+	node->hj_CurKeyCache = NULL;
 
 	node->hj_MatchedOuter = false;
 	node->hj_FirstOuterTupleSlot = NULL;
