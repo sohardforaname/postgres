@@ -26,6 +26,20 @@ memsets(char *dst, const char *src, int slen, int count)
 	return;
 }
 
+static void
+capped_memset(char *dst, char c, int count, int blocksz)
+{
+	while (count > 0)
+	{
+		int			chunk = Min(count, blocksz);
+
+		memset(dst, c, chunk);
+		dst += chunk;
+		count -= chunk;
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
 /* master */
 static void
 strat_linear(char *dst, const char *src, int slen, int count)
@@ -46,7 +60,8 @@ strat_double(char *dst, const char *src, int slen, int count)
 {
 	char	   *cp = dst;
 
-	if (slen == 1) {
+	if (slen == 1)
+	{
 		memsets(cp, src, slen, count);
 		return;
 	}
@@ -74,6 +89,7 @@ strat_double(char *dst, const char *src, int slen, int count)
  * The block limit is computed once rather than multiplied per iteration.
  * A one-copy block holds the same bytes as src, and reading it there keeps
  * large sources identical to master.
+ * For single-byte inputs, blocksz is a hard upper bound on each memset().
  */
 static void
 capped(char *dst, const char *src, int slen, int count, int blocksz)
@@ -82,7 +98,15 @@ capped(char *dst, const char *src, int slen, int count, int blocksz)
 	const char *from;
 	int			curcount = 1;
 	int			blockcount;
-	int			blocklimit = (blocksz - 1) / slen + 1;	/* ceil, no overflow */
+	int			blocklimit;
+
+	if (slen == 1)
+	{
+		capped_memset(dst, src[0], count, blocksz);
+		return;
+	}
+
+	blocklimit = (blocksz - 1) / slen + 1;	/* ceil, no overflow */
 
 	memcpy(cp, src, slen);
 	cp += slen;
@@ -244,13 +268,13 @@ Datum
 repeat_bench(PG_FUNCTION_ARGS)
 {
 	static const int cases[][2] = {
-		/* small counts, densely either side of the patch's threshold of 8 */
+		/* small repeat counts */
 		{32, 2}, {32, 4}, {32, 6}, {32, 7}, {32, 8}, {32, 9}, {32, 12},
 		{32, 16}, {32, 64}, {32, 4096},
-		/* 16 MB of output: usually still cache-resident */
+		/* 16 MB of output */
 		{1, 16777216}, {10, 1677721}, {100, 167772},
 		{1024, 16384}, {65536, 256}, {1048576, 16},
-		/* 256 MB of output: far beyond any cache */
+		/* 256 MB of output */
 		{1, 268435456}, {10, 26843545}, {100, 2684354},
 		{1024, 262144}, {65536, 4096}, {1048576, 256},
 		/* single-byte sources */
