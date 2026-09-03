@@ -1,0 +1,4 @@
+comment = 'Benchmark delayed projection for ORDER BY ... LIMIT queries'
+default_version = '1.0'
+module_pathname = '$libdir/topnbench'
+relocatable = true
