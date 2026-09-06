@@ -121,6 +121,15 @@
 #define APPEND_CPU_COST_MULTIPLIER 0.5
 
 /*
+ * tuplesort copies every input tuple into its own memory context before it
+ * can compare or discard the tuple.  Charge one cpu_operator_cost for each
+ * approximate 128 bytes copied.  This is intentionally a conservative first
+ * estimate; unlike the existing I/O costing, it makes in-memory sort cost
+ * sensitive to tuple width.
+ */
+#define TUPLESORT_BYTES_PER_COPY_COST 128.0
+
+/*
  * Maximum value for row estimates.  We cap row estimates to this to help
  * ensure that costs based on these estimates remain within the range of what
  * double can represent.  add_path() wouldn't act sanely given infinite or NaN
@@ -2026,6 +2035,19 @@ cost_tuplesort(Cost *startup_cost, Cost *run_cost,
 		/* We'll use plain quicksort on all the input tuples */
 		*startup_cost = comparison_cost * tuples * LOG2(tuples);
 	}
+
+	/*
+	 * tuplesort_puttupleslot() calls ExecCopySlotMinimalTuple() before the
+	 * bounded-heap comparison, so even an input tuple that is immediately
+	 * discarded has already been copied.  This work is paid for all input
+	 * tuples, not just the tuples surviving a bounded sort, and must be startup
+	 * cost because Sort consumes its input before returning a row.  The POC GUC
+	 * also gates this term so benchmark runs with it disabled retain upstream
+	 * costing as well as upstream projection placement.
+	 */
+	if (enable_cost_based_delayed_projection)
+		*startup_cost += cpu_operator_cost * input_bytes /
+			TUPLESORT_BYTES_PER_COPY_COST;
 
 	/*
 	 * Also charge a small amount (arbitrarily set equal to operator cost) per

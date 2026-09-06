@@ -877,6 +877,13 @@
   boot_val => 'true',
 },
 
+{ name => 'enable_cost_based_delayed_projection', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Enables cost-based placement of target-list expressions around top-N sorts.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'enable_cost_based_delayed_projection',
+  boot_val => 'true',
+},
+
 { name => 'enable_distinct_reordering', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
   short_desc => 'Enables reordering of DISTINCT keys.',
   flags => 'GUC_EXPLAIN',

@@ -68,6 +68,7 @@
 double		cursor_tuple_fraction = DEFAULT_CURSOR_TUPLE_FRACTION;
 int			debug_parallel_query = DEBUG_PARALLEL_OFF;
 bool		parallel_leader_participation = true;
+bool		enable_cost_based_delayed_projection = true;
 bool		enable_distinct_reordering = true;
 
 /* Hook for plugins to get control in planner() */
@@ -224,8 +225,8 @@ static List *get_useful_pathkeys_for_distinct(PlannerInfo *root,
 static RelOptInfo *create_ordered_paths(PlannerInfo *root,
 										RelOptInfo *input_rel,
 										PathTarget *target,
+										PathTarget *early_target,
 										bool target_parallel_safe,
-										bool postpone_projection_in_leader,
 										double limit_tuples);
 static PathTarget *make_group_input_target(PlannerInfo *root,
 										   PathTarget *final_target);
@@ -244,8 +245,7 @@ static List *make_pathkeys_for_window(PlannerInfo *root, WindowClause *wc,
 									  List *tlist);
 static PathTarget *make_sort_input_target(PlannerInfo *root,
 										  PathTarget *final_target,
-										  double input_rows,
-										  bool *postpone_projection_in_leader,
+										  PathTarget **early_target,
 										  bool *have_postponed_srfs);
 static void adjust_paths_for_srfs(PlannerInfo *root, RelOptInfo *rel,
 								  List *targets, List *targets_contain_srfs);
@@ -1699,9 +1699,9 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 	int64		offset_est = 0;
 	int64		count_est = 0;
 	double		limit_tuples = -1.0;
-	bool		postpone_projection_in_leader = false;
 	bool		have_postponed_srfs = false;
 	PathTarget *final_target;
+	PathTarget *sort_early_target = NULL;
 	List	   *final_targets;
 	List	   *final_targets_contain_srfs;
 	bool		final_target_parallel_safe;
@@ -1937,8 +1937,7 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 		{
 			sort_input_target = make_sort_input_target(root,
 													   final_target,
-													   current_rel->rows,
-													   &postpone_projection_in_leader,
+													   &sort_early_target,
 													   &have_postponed_srfs);
 			sort_input_target_parallel_safe =
 				is_parallel_safe(root, (Node *) sort_input_target->exprs);
@@ -2116,8 +2115,8 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 		current_rel = create_ordered_paths(root,
 										   current_rel,
 										   final_target,
+										   sort_early_target,
 										   final_target_parallel_safe,
-										   postpone_projection_in_leader,
 										   have_postponed_srfs ? -1.0 :
 										   limit_tuples);
 		/* Fix things up if final_target contains SRFs */
@@ -5556,6 +5555,9 @@ get_useful_pathkeys_for_distinct(PlannerInfo *root, List *needed_pathkeys,
  *
  * input_rel: contains the source-data Paths
  * target: the output tlist the result Paths must emit
+ * early_target: if not NULL, also build paths that evaluate this target
+ *		before sorting; input_rel's paths already emit the alternative late
+ *		target
  * limit_tuples: estimated bound on the number of output tuples,
  *		or -1 if no LIMIT or couldn't estimate
  *
@@ -5566,8 +5568,8 @@ static RelOptInfo *
 create_ordered_paths(PlannerInfo *root,
 					 RelOptInfo *input_rel,
 					 PathTarget *target,
+					 PathTarget *early_target,
 					 bool target_parallel_safe,
-					 bool postpone_projection_in_leader,
 					 double limit_tuples)
 {
 	Path	   *cheapest_input_path = input_rel->cheapest_total_path;
@@ -5600,6 +5602,7 @@ create_ordered_paths(PlannerInfo *root,
 	{
 		Path	   *input_path = (Path *) lfirst(lc);
 		Path	   *sorted_path;
+		Path	   *early_sorted_path = NULL;
 		bool		is_sorted;
 		int			presorted_keys;
 
@@ -5642,20 +5645,51 @@ create_ordered_paths(PlannerInfo *root,
 		}
 
 		/*
+		 * If cost-based projection placement is applicable, build the
+		 * competing path that evaluates the complete target before Sort.  Use
+		 * create_projection_path() so that the late input path is not
+		 * modified in place; both alternatives must remain available for
+		 * costing.
+		 */
+		if (early_target != NULL)
+		{
+			Path	   *early_input_path;
+
+			early_input_path = (Path *)
+				create_projection_path(root, input_path->parent,
+									   input_path, early_target);
+			if (is_sorted)
+				early_sorted_path = early_input_path;
+			else if (presorted_keys == 0 || !enable_incremental_sort)
+				early_sorted_path = (Path *) create_sort_path(root,
+															  ordered_rel,
+															  early_input_path,
+															  root->sort_pathkeys,
+															  limit_tuples);
+			else
+				early_sorted_path = (Path *)
+					create_incremental_sort_path(root, ordered_rel,
+												 early_input_path,
+												 root->sort_pathkeys,
+												 presorted_keys,
+												 limit_tuples);
+
+			add_path(ordered_rel, early_sorted_path);
+		}
+
+		/*
 		 * If the pathtarget of the result path has different expressions from
 		 * the target to be applied, a projection step is needed.
 		 */
 		if (!equal(sorted_path->pathtarget->exprs, target->exprs))
 		{
-			if (postpone_projection_in_leader &&
-				(IsA(sorted_path, GatherPath) ||
-				 IsA(sorted_path, GatherMergePath)))
+			if (early_target != NULL)
 				sorted_path = (Path *)
 					create_projection_path(root, ordered_rel,
-									   sorted_path, target);
+										   sorted_path, target);
 			else
 				sorted_path = apply_projection_to_path(root, ordered_rel,
-												   sorted_path, target);
+													   sorted_path, target);
 		}
 
 		add_path(ordered_rel, sorted_path);
@@ -5683,6 +5717,7 @@ create_ordered_paths(PlannerInfo *root,
 		{
 			Path	   *input_path = (Path *) lfirst(lc);
 			Path	   *sorted_path;
+			Path	   *early_sorted_path = NULL;
 			bool		is_sorted;
 			int			presorted_keys;
 			double		total_groups;
@@ -5731,19 +5766,50 @@ create_ordered_paths(PlannerInfo *root,
 										 root->sort_pathkeys, NULL,
 										 &total_groups);
 
+			/* Build the corresponding worker-side early projection path. */
+			if (early_target != NULL)
+			{
+				Path	   *early_input_path;
+
+				early_input_path = (Path *)
+					create_projection_path(root, input_path->parent,
+										   input_path, early_target);
+				if (presorted_keys == 0 || !enable_incremental_sort)
+					early_sorted_path = (Path *) create_sort_path(root,
+																  ordered_rel,
+																  early_input_path,
+																  root->sort_pathkeys,
+																  limit_tuples);
+				else
+					early_sorted_path = (Path *)
+						create_incremental_sort_path(root, ordered_rel,
+													 early_input_path,
+													 root->sort_pathkeys,
+													 presorted_keys,
+													 limit_tuples);
+				total_groups = compute_gather_rows(early_sorted_path);
+				early_sorted_path = (Path *)
+					create_gather_merge_path(root, ordered_rel,
+											 early_sorted_path,
+											 early_sorted_path->pathtarget,
+											 root->sort_pathkeys, NULL,
+											 &total_groups);
+				add_path(ordered_rel, early_sorted_path);
+			}
+
 			/*
 			 * If the pathtarget of the result path has different expressions
 			 * from the target to be applied, a projection step is needed.
 			 */
 			if (!equal(sorted_path->pathtarget->exprs, target->exprs))
 			{
-				if (postpone_projection_in_leader)
+				if (early_target != NULL)
 					sorted_path = (Path *)
 						create_projection_path(root, ordered_rel,
-										   sorted_path, target);
+											   sorted_path, target);
 				else
 					sorted_path = apply_projection_to_path(root, ordered_rel,
-													   sorted_path, target);
+														   sorted_path, target);
 			}
 
 			add_path(ordered_rel, sorted_path);
@@ -6649,12 +6715,10 @@ make_pathkeys_for_window(PlannerInfo *root, WindowClause *wc,
  * any volatile or set-returning expressions (since once we've put in a
  * projection at all, it won't cost any more to postpone more stuff).
  *
- * Another issue that could potentially be considered here is that
- * evaluating tlist expressions could result in data that's either wider
- * or narrower than the input Vars, thus changing the volume of data that
- * has to go through the Sort.  However, we usually have only a very bad
- * idea of the output width of any expression more complex than a Var,
- * so for now it seems too risky to try to optimize on that basis.
+ * If a directly applicable LIMIT is known, evaluating tlist expressions
+ * could make the sort input either wider or narrower.  In that case we can
+ * expose both early- and late-projection paths and let the normal path
+ * costing account for expression cost, tuple width, work_mem, and LIMIT.
  *
  * Note that if we do produce a modified sort-input target, and then the
  * query ends up not using an explicit Sort, no particular harm is done:
@@ -6671,9 +6735,8 @@ make_pathkeys_for_window(PlannerInfo *root, WindowClause *wc,
  * computed earlier.
  *
  * 'final_target' is the query's final target list (in PathTarget form)
- * 'input_rows' is the estimated number of rows before the Sort step
- * 'postpone_projection_in_leader' is set if a Top-N cost decision postponed
- * expressions that should not be pushed below a Gather or Gather Merge
+ * '*early_target' receives the target for a competing early-projection path,
+ * or NULL when no such path should be considered
  * 'have_postponed_srfs' is an output argument, see below
  *
  * The result is the PathTarget to be computed by the plan node immediately
@@ -6686,8 +6749,7 @@ make_pathkeys_for_window(PlannerInfo *root, WindowClause *wc,
 static PathTarget *
 make_sort_input_target(PlannerInfo *root,
 					   PathTarget *final_target,
-					   double input_rows,
-					   bool *postpone_projection_in_leader,
+					   PathTarget **early_target,
 					   bool *have_postponed_srfs)
 {
 	Query	   *parse = root->parse;
@@ -6695,11 +6757,10 @@ make_sort_input_target(PlannerInfo *root,
 	int			ncols;
 	bool	   *col_is_srf;
 	bool	   *postpone_col;
-	Cost	   *col_cost;
-	Cost		postponable_cost = 0;
 	bool		have_srf;
 	bool		have_volatile;
 	bool		have_expensive;
+	bool		have_cost_candidates = false;
 	bool		have_srf_sortcols;
 	bool		postpone_srfs;
 	List	   *postponable_cols;
@@ -6710,14 +6771,13 @@ make_sort_input_target(PlannerInfo *root,
 	/* Shouldn't get here unless query has ORDER BY */
 	Assert(parse->sortClause);
 
-	*postpone_projection_in_leader = false;
+	*early_target = NULL;
 	*have_postponed_srfs = false;	/* default results */
 
 	/* Inspect tlist and collect per-column information */
 	ncols = list_length(final_target->exprs);
 	col_is_srf = palloc0_array(bool, ncols);
 	postpone_col = palloc0_array(bool, ncols);
-	col_cost = palloc0_array(Cost, ncols);
 	have_srf = have_volatile = have_expensive = have_srf_sortcols = false;
 
 	i = 0;
@@ -6762,8 +6822,6 @@ make_sort_input_target(PlannerInfo *root,
 				QualCost	cost;
 
 				cost_qual_eval_node(&cost, (Node *) expr, root);
-				col_cost[i] = cost.per_tuple;
-				postponable_cost += cost.per_tuple;
 
 				/*
 				 * We arbitrarily define "expensive" as "more than 10X
@@ -6790,32 +6848,36 @@ make_sort_input_target(PlannerInfo *root,
 	}
 
 	/*
-	 * The fixed per-expression threshold above misses target lists made up of
-	 * several individually cheap expressions when a small LIMIT means that
-	 * very few input rows survive the Sort.  In that case, compare the cost
-	 * avoided on discarded rows with a conservative per-output-row threshold.
-	 *
-	 * root->limit_tuples is positive only when LIMIT/OFFSET could be
-	 * estimated and can safely be applied to the scan/join result.  Keep the
-	 * historical factor of 10, but scale it by the number of rows expected to
-	 * survive rather than applying it independently to every input row.
+	 * A known LIMIT can make even individually cheap expressions worth
+	 * postponing, while the width of their input Vars can make early
+	 * evaluation preferable.  Mark every safe non-Var expression as
+	 * postponable and ask create_ordered_paths() to build both alternatives.
+	 * Volatile expressions and SRFs retain the existing semantic placement
+	 * rules and are deliberately excluded from this competition.
 	 */
-	if (root->limit_tuples > 0 &&
-		input_rows > root->limit_tuples &&
-		postponable_cost * (input_rows - root->limit_tuples) >
-		10 * cpu_operator_cost * root->limit_tuples)
+	if (enable_cost_based_delayed_projection &&
+		root->limit_tuples > 0 && !have_srf && !have_volatile)
 	{
 		i = 0;
 		foreach(lc, final_target->exprs)
 		{
-			/* Zero means a Var, Const, or another cost-free expression. */
-			if (col_cost[i] > 0)
+			Expr	   *expr = (Expr *) lfirst(lc);
+
+			if (get_pathtarget_sortgroupref(final_target, i) == 0 &&
+				!IsA(expr, Var))
+			{
 				postpone_col[i] = true;
+				have_cost_candidates = true;
+			}
 			i++;
 		}
 
-		have_expensive = true;
-		*postpone_projection_in_leader = true;
+		if (have_cost_candidates)
+		{
+			/* Use the existing construction and return logic below. */
+			have_expensive = true;
+			*early_target = final_target;
+		}
 	}
 
 	/*
