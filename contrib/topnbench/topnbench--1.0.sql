@@ -140,8 +140,31 @@ RETURNS TABLE (
 AS 'MODULE_PATHNAME', 'topnbench_compare'
 LANGUAGE C VOLATILE PARALLEL UNSAFE;
 
+CREATE FUNCTION topnbench_measure(
+    query text,
+    iterations integer DEFAULT 5,
+    work_mem_setting text DEFAULT NULL)
+RETURNS TABLE (
+    plan_nodes text,
+    launched_workers integer,
+    startup_cost double precision,
+    total_cost double precision,
+    estimated_sort_rows double precision,
+    actual_sort_input_rows double precision,
+    estimated_sort_width integer,
+    sort_method text,
+    sort_space_type text,
+    sort_space_used_kb double precision,
+    minimum_ms double precision,
+    median_ms double precision)
+AS 'MODULE_PATHNAME', 'topnbench_measure'
+LANGUAGE C VOLATILE PARALLEL UNSAFE;
+
 COMMENT ON FUNCTION topnbench_run(regclass, name, integer, text, boolean) IS
 'Measure delayed-projection decision quality over a curated case matrix.';
 
 COMMENT ON FUNCTION topnbench_compare(text, text, text, integer, boolean, text) IS
 'Compare automatic, manually delayed, and forced-early SELECT statements, optionally under a specified work_mem, rotating execution order and reporting minimum and median execution times.';
+
+COMMENT ON FUNCTION topnbench_measure(text, integer, text) IS
+'Measure one SELECT and report root cost, Sort metadata, and execution time.';

@@ -18,14 +18,23 @@ make PG_CONFIG=/path/to/pg_config install
 psql -X -f benchmark.sql postgres
 ```
 
+The default report is compact.  Add `-v topnbench_verbose=true` to print every
+per-case row, candidate-path diagnostic, and raw width-calibration point.
+
 `benchmark.sql` drops and recreates the extension, a one-million-row main
-table, and two smaller width-estimation tables.  The POC patch provides the
-temporary `enable_cost_based_delayed_projection` GUC.  Both the generated
-quick matrix and every hand-written supplemental case run first with the GUC
-disabled, reproducing the upstream projection policy, and then with it enabled.
-This compares planner choices in one backend without cross-build timing noise.
-The GUC and this comparison are development aids and are not intended for the
-commit-ready patch.
+table, two smaller width-estimation tables, and six accurately analyzed width
+tables.  The POC patch provides temporary
+`enable_cost_based_delayed_projection` and
+`enable_sort_tuple_width_cost` GUCs.  Every case runs under three policies:
+
+- `master`: both GUCs off, reproducing the upstream planner;
+- `path-only`: delayed-projection paths on, width-sensitive Sort cost off;
+- `patched`: both features on.
+
+This separates the effect of constructing two competing projection paths from
+the effect of the new Sort cost, using one backend without cross-build timing
+noise.  Both GUCs are development aids and are not intended for a commit-ready
+patch.
 
 The extension script must be named `topnbench--1.0.sql` because PostgreSQL's
 extension loader requires a versioned installation script.  That is only the
@@ -165,6 +174,14 @@ separate planner inputs from execution reality:
   smaller LIMITs exercise the crossover between that cost and avoided
   expression work.
 
+The same six tables also feed a pure Sort calibration.  It compares
+`SELECT sort_key ... ORDER BY ... LIMIT` with an otherwise identical query
+that carries `payload` through Sort.  There are no computed target expressions,
+so the cost and time deltas isolate width-sensitive Sort work from expression
+evaluation and Result-node overhead.  The compact report shows the first width
+that is at least 10% slower, the worst time ratio, and the correlation between
+estimated and measured deltas for each LIMIT fraction.
+
 The supplemental catalog is executed in three phases so that normal parallel
 settings, deliberately stale statistics, and repaired width statistics cannot
 be mixed accidentally.  Cases are summarized by category as well as for the
@@ -183,6 +200,26 @@ as `improvement`, `regression`, `unchanged-correct`, `unchanged-miss`, or
 either run reports a tie, or the measured winner changes between the two runs.
 Strategy speedups use the late and early timings from the POC run, so both
 choices are compared under the same run conditions.
+The same tables contain `width_cost_effect`, which performs the identical
+classification between `path-only` and `patched`.  This is the direct answer
+to whether the width term improved or regressed a decision.
+
+## Experimental Sort width cost
+
+The POC models two kinds of memory work in `cost_tuplesort()`:
+
+```text
+cpu_operator_cost *
+    (input_bytes / 1024 + resident_bytes / 64)
+```
+
+`input_bytes` represents touching/copying every tuple presented to tuplesort.
+`resident_bytes` represents the bounded result retained in memory and is
+capped at `work_mem` when the sort spills; width-dependent spill I/O is already
+charged by the existing costing code.  The divisors are calibration points,
+not proposed final constants.  `topnbench_measure()` and the pure Sort matrix
+exist specifically to test whether the two terms track measured executor work
+before tuning those values further.
 
 ## Candidate path costs
 
@@ -238,3 +275,15 @@ SELECT * FROM topnbench_compare(auto_sql, late_sql, early_sql,
 The function rejects multiple statements, non-SELECT statements, `SELECT
 INTO`, and row-locking clauses.  Benchmark only side-effect-free expressions.
 Keep verification enabled for results shared on pgsql-hackers.
+
+For a single query without early/late rewrites, use `topnbench_measure()`:
+
+```sql
+SELECT * FROM topnbench_measure(
+  'SELECT sort_key, payload FROM t ORDER BY sort_key LIMIT 1000',
+  7,
+  '1GB');
+```
+
+It reports root startup/total cost, Sort rows, width, method and memory, plus
+minimum and median execution time.

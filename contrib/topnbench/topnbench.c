@@ -34,6 +34,7 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(topnbench_work);
 PG_FUNCTION_INFO_V1(topnbench_run);
 PG_FUNCTION_INFO_V1(topnbench_compare);
+PG_FUNCTION_INFO_V1(topnbench_measure);
 
 #define DECISION_NOISE_FRACTION 0.03
 
@@ -82,6 +83,8 @@ typedef struct BenchCase
 typedef struct ExplainResult
 {
 	double		milliseconds;
+	double		startup_cost;
+	double		total_cost;
 	int			launched_workers;
 	int			sort_output_columns;
 	char	   *sort_output_signature;
@@ -914,6 +917,8 @@ run_explain(const char *query)
 	result.milliseconds = extract_json_double(json, "\"Execution Time\"", -1.0);
 	if (result.milliseconds < 0)
 		ereport(ERROR, (errmsg("could not read Execution Time from EXPLAIN JSON")));
+	result.startup_cost = extract_json_double(json, "\"Startup Cost\"", -1.0);
+	result.total_cost = extract_json_double(json, "\"Total Cost\"", -1.0);
 	result.launched_workers = extract_max_workers(json);
 	result.sort_output_columns = extract_sort_output_columns(json);
 	result.sort_output_signature = extract_sort_output_signature(json);
@@ -1860,6 +1865,131 @@ topnbench_compare(PG_FUNCTION_ARGS)
 	if (result.forced_early_sort_space_type != NULL)
 		pfree(result.forced_early_sort_space_type);
 	pfree(result.nodes);
+
+	return (Datum) 0;
+}
+
+/*
+ * Measure one query without constructing early/late rewrites.  This is used
+ * by benchmark.sql to compare narrow and wide Sort inputs while keeping the
+ * scan, key distribution, LIMIT, and executor instrumentation identical.
+ */
+Datum
+topnbench_measure(PG_FUNCTION_ARGS)
+{
+	char	   *query = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int			iterations = PG_GETARG_INT32(1);
+	char	   *work_mem_setting =
+		(PG_NARGS() > 2 && !PG_ARGISNULL(2)) ?
+		text_to_cstring(PG_GETARG_TEXT_PP(2)) : NULL;
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	ExplainResult warmup;
+	TimingSummary timing;
+	double	   *times;
+	char	   *nodes = NULL;
+	char	   *sort_method = NULL;
+	char	   *sort_space_type = NULL;
+	Datum		values[12];
+	bool		nulls[12] = {false};
+	int			save_nestlevel;
+
+	if (iterations < 1 || iterations > 100)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("iterations must be between 1 and 100")));
+	validate_select(query);
+
+	InitMaterializedSRF(fcinfo, 0);
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	save_nestlevel = NewGUCNestLevel();
+
+	PG_TRY();
+	{
+		if (work_mem_setting != NULL)
+		{
+			char	   *quoted = quote_literal_cstr(work_mem_setting);
+
+			set_local("work_mem", quoted);
+			pfree(quoted);
+		}
+		set_local("jit", "off");
+
+		warmup = run_explain(query);
+		nodes = spi_pstrdup_nullable(warmup.nodes);
+		sort_method = spi_pstrdup_nullable(warmup.sort_method);
+		sort_space_type = spi_pstrdup_nullable(warmup.sort_space_type);
+
+		times = palloc_array(double, iterations);
+		for (int i = 0; i < iterations; i++)
+		{
+			ExplainResult measured;
+
+			CHECK_FOR_INTERRUPTS();
+			measured = run_explain(query);
+			times[i] = measured.milliseconds;
+			free_explain_strings(&measured);
+		}
+		timing = summarize_timings(times, iterations);
+		pfree(times);
+		free_explain_strings(&warmup);
+	}
+	PG_CATCH();
+	{
+		AtEOXact_GUC(false, save_nestlevel);
+		SPI_finish();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	AtEOXact_GUC(false, save_nestlevel);
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "SPI_finish failed");
+
+	values[0] = CStringGetTextDatum(nodes);
+	values[1] = Int32GetDatum(warmup.launched_workers);
+	if (warmup.startup_cost < 0.0)
+		nulls[2] = true;
+	else
+		values[2] = Float8GetDatum(warmup.startup_cost);
+	if (warmup.total_cost < 0.0)
+		nulls[3] = true;
+	else
+		values[3] = Float8GetDatum(warmup.total_cost);
+	if (warmup.estimated_sort_rows < 0.0)
+		nulls[4] = true;
+	else
+		values[4] = Float8GetDatum(warmup.estimated_sort_rows);
+	if (warmup.actual_sort_input_rows < 0.0)
+		nulls[5] = true;
+	else
+		values[5] = Float8GetDatum(warmup.actual_sort_input_rows);
+	if (warmup.estimated_sort_width < 0)
+		nulls[6] = true;
+	else
+		values[6] = Int32GetDatum(warmup.estimated_sort_width);
+	if (sort_method == NULL)
+		nulls[7] = true;
+	else
+		values[7] = CStringGetTextDatum(sort_method);
+	if (sort_space_type == NULL)
+		nulls[8] = true;
+	else
+		values[8] = CStringGetTextDatum(sort_space_type);
+	if (warmup.sort_space_used_kb < 0.0)
+		nulls[9] = true;
+	else
+		values[9] = Float8GetDatum(warmup.sort_space_used_kb);
+	values[10] = Float8GetDatum(timing.minimum);
+	values[11] = Float8GetDatum(timing.median);
+
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	if (nodes != NULL)
+		pfree(nodes);
+	if (sort_method != NULL)
+		pfree(sort_method);
+	if (sort_space_type != NULL)
+		pfree(sort_space_type);
 
 	return (Datum) 0;
 }
