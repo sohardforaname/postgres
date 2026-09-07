@@ -2,6 +2,14 @@
 \pset pager off
 \timing on
 
+-- Default output is compact.  Run with
+--   psql -v topnbench_verbose=true -f contrib/topnbench/benchmark.sql
+-- to include every per-case diagnostic row.
+\if :{?topnbench_verbose}
+\else
+\set topnbench_verbose false
+\endif
+
 \echo
 \echo '== Setup =='
 
@@ -39,12 +47,21 @@ ANALYZE topnbench_data;
 -- upstream per-expression rule; it is not the same as forcing early
 -- projection.
 SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
 DROP TABLE IF EXISTS topnbench_master_results;
 CREATE TEMP TABLE topnbench_master_results AS
 SELECT *
 FROM topnbench_run('topnbench_data', 'a_random', 5, 'quick', true);
 
+-- Isolate the delayed-projection path construction from the new Sort cost.
 SET enable_cost_based_delayed_projection = on;
+SET enable_sort_tuple_width_cost = off;
+DROP TABLE IF EXISTS topnbench_path_only_results;
+CREATE TEMP TABLE topnbench_path_only_results AS
+SELECT *
+FROM topnbench_run('topnbench_data', 'a_random', 5, 'quick', true);
+
+SET enable_sort_tuple_width_cost = on;
 
 -- Materialize the POC run once so that the detail and summary queries below
 -- use exactly the same measurements.
@@ -53,6 +70,7 @@ CREATE TEMP TABLE topnbench_results AS
 SELECT *
 FROM topnbench_run('topnbench_data', 'a_random', 5, 'quick', true);
 
+\if :topnbench_verbose
 SELECT case_name,
        round(selectivity::numeric, 6) AS selectivity,
        expression_shape,
@@ -77,6 +95,7 @@ SELECT case_name,
        structural_model_choice AS structural_model
 FROM topnbench_results
 ORDER BY ctid;
+\endif
 
 SELECT count(*) FILTER (WHERE planner_choice_correct) AS planner_correct,
        count(*) FILTER (WHERE planner_choice_correct = false) AS planner_wrong,
@@ -92,8 +111,8 @@ SELECT count(*) FILTER (WHERE planner_choice_correct) AS planner_correct,
        count(*) FILTER (WHERE structural_model_correct = false) AS structural_wrong
 FROM topnbench_results;
 
--- Compare planner decisions, using both runs only to establish whether the
--- measured winner was stable.  Strategy timings come from the POC run, so
+-- Compare planner decisions, using all policy runs only to establish whether
+-- the measured winner was stable.  Strategy timings come from the POC run, so
 -- the speedup is not contaminated by cross-run cache or frequency changes.
 DROP TABLE IF EXISTS topnbench_choice_comparison;
 CREATE TEMP TABLE topnbench_choice_comparison AS
@@ -101,8 +120,10 @@ WITH paired AS
 (
     SELECT p.case_name,
            m.planner_choice AS master_choice,
+           o.planner_choice AS path_only_choice,
            p.planner_choice AS patched_choice,
            m.actual_winner AS master_actual_winner,
+           o.actual_winner AS path_only_actual_winner,
            p.actual_winner AS patched_actual_winner,
            CASE m.planner_choice
                WHEN 'late' THEN p.manual_late_median_ms
@@ -111,9 +132,14 @@ WITH paired AS
            CASE p.planner_choice
                WHEN 'late' THEN p.manual_late_median_ms
                WHEN 'early' THEN p.forced_early_median_ms
-           END AS patched_strategy_ms
+           END AS patched_strategy_ms,
+           CASE o.planner_choice
+               WHEN 'late' THEN p.manual_late_median_ms
+               WHEN 'early' THEN p.forced_early_median_ms
+           END AS path_only_strategy_ms
     FROM topnbench_results AS p
     JOIN topnbench_master_results AS m USING (case_name)
+    JOIN topnbench_path_only_results AS o USING (case_name)
 ), classified AS
 (
     SELECT paired.*,
@@ -135,25 +161,50 @@ WITH paired AS
                WHEN master_choice = patched_actual_winner
                    THEN 'regression'
                ELSE 'inconclusive'
-           END AS patch_effect
+           END AS patch_effect,
+           CASE
+               WHEN path_only_choice IS NULL OR patched_choice IS NULL OR
+                    path_only_choice = 'unknown' OR
+                    patched_choice = 'unknown' OR
+                    path_only_actual_winner = 'tie' OR
+                    patched_actual_winner = 'tie' OR
+                    path_only_actual_winner <> patched_actual_winner
+                   THEN 'inconclusive'
+               WHEN path_only_choice = patched_choice AND
+                    patched_choice = patched_actual_winner
+                   THEN 'unchanged-correct'
+               WHEN path_only_choice = patched_choice
+                   THEN 'unchanged-miss'
+               WHEN patched_choice = patched_actual_winner
+                   THEN 'improvement'
+               WHEN path_only_choice = patched_actual_winner
+                   THEN 'regression'
+               ELSE 'inconclusive'
+           END AS width_cost_effect
     FROM paired
 )
 SELECT classified.*,
        master_strategy_ms / NULLIF(patched_strategy_ms, 0) AS
-           patch_vs_master_speedup
+           patch_vs_master_speedup,
+       path_only_strategy_ms / NULLIF(patched_strategy_ms, 0) AS
+           width_cost_vs_path_only_speedup
 FROM classified;
 
+\if :topnbench_verbose
 SELECT case_name,
        master_choice,
+       path_only_choice,
        patched_choice,
        patched_actual_winner AS actual_winner,
        patch_effect,
+       width_cost_effect,
        round(master_strategy_ms::numeric, 3) AS master_strategy_ms,
        round(patched_strategy_ms::numeric, 3) AS patched_strategy_ms,
        round(patch_vs_master_speedup::numeric, 3) AS
            patch_vs_master_speedup
 FROM topnbench_choice_comparison
 ORDER BY case_name;
+\endif
 
 SELECT count(*) FILTER (WHERE master_choice <> patched_choice) AS
            changed_choices,
@@ -166,6 +217,12 @@ SELECT count(*) FILTER (WHERE master_choice <> patched_choice) AS
        count(*) FILTER (WHERE patch_effect = 'unchanged-miss') AS
            unchanged_misses,
        count(*) FILTER (WHERE patch_effect = 'inconclusive') AS inconclusive,
+       count(*) FILTER (WHERE path_only_choice <> patched_choice) AS
+           width_cost_changes,
+       count(*) FILTER (WHERE width_cost_effect = 'improvement') AS
+           width_cost_improvements,
+       count(*) FILTER (WHERE width_cost_effect = 'regression') AS
+           width_cost_regressions,
        round(max(CASE WHEN patch_effect = 'improvement'
                       THEN patch_vs_master_speedup END)::numeric, 3) AS
            best_new_speedup,
@@ -258,6 +315,7 @@ WITH NO DATA;
 \echo '== Supplemental phase: representative expressions =='
 
 SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
 INSERT INTO topnbench_supplemental_results
 SELECT 'master', d.case_order, d.phase, d.category, d.case_name, c.*
 FROM topnbench_case_definitions AS d
@@ -268,6 +326,16 @@ WHERE d.phase = 'parallel-expressions'
 ORDER BY d.case_order;
 
 SET enable_cost_based_delayed_projection = on;
+INSERT INTO topnbench_supplemental_results
+SELECT 'path-only', d.case_order, d.phase, d.category, d.case_name, c.*
+FROM topnbench_case_definitions AS d
+CROSS JOIN LATERAL topnbench_compare(
+    d.auto_query, d.manual_late_query, d.forced_early_query,
+    d.iterations, true, d.work_mem_setting) AS c
+WHERE d.phase = 'parallel-expressions'
+ORDER BY d.case_order;
+
+SET enable_sort_tuple_width_cost = on;
 INSERT INTO topnbench_supplemental_results
 SELECT 'patched', d.case_order, d.phase, d.category, d.case_name, c.*
 FROM topnbench_case_definitions AS d
@@ -466,6 +534,7 @@ FROM (VALUES (1, '64kB'), (2, '256kB'), (3, '1MB'), (4, '4MB'),
 \echo '== Supplemental phase: stale statistics and adversarial inputs =='
 
 SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
 INSERT INTO topnbench_supplemental_results
 SELECT 'master', d.case_order, d.phase, d.category, d.case_name, c.*
 FROM topnbench_case_definitions AS d
@@ -476,6 +545,16 @@ WHERE d.phase = 'serial-stale'
 ORDER BY d.case_order;
 
 SET enable_cost_based_delayed_projection = on;
+INSERT INTO topnbench_supplemental_results
+SELECT 'path-only', d.case_order, d.phase, d.category, d.case_name, c.*
+FROM topnbench_case_definitions AS d
+CROSS JOIN LATERAL topnbench_compare(
+    d.auto_query, d.manual_late_query, d.forced_early_query,
+    d.iterations, true, d.work_mem_setting) AS c
+WHERE d.phase = 'serial-stale'
+ORDER BY d.case_order;
+
+SET enable_sort_tuple_width_cost = on;
 INSERT INTO topnbench_supplemental_results
 SELECT 'patched', d.case_order, d.phase, d.category, d.case_name, c.*
 FROM topnbench_case_definitions AS d
@@ -533,6 +612,97 @@ WHERE schemaname = current_schema()
   AND tablename LIKE 'topnbench_copy_width_%'
   AND attname = 'payload'
 ORDER BY avg_width;
+
+\echo
+\echo '== Pure Sort width calibration =='
+
+-- Unlike the early/late comparisons below, these query pairs contain no
+-- computed target expressions.  Their only intended difference is whether
+-- payload is carried through Sort, so the measured delta calibrates the new
+-- width term without expression-cost or Result-node overhead.
+SET enable_cost_based_delayed_projection = on;
+SET enable_sort_tuple_width_cost = on;
+DROP TABLE IF EXISTS topnbench_sort_calibration_raw;
+CREATE TEMP TABLE topnbench_sort_calibration_raw AS
+SELECT w.width_bytes,
+       l.limit_order,
+       l.limit_label,
+       l.limit_rows,
+       s.shape,
+       m.*
+FROM (VALUES
+          (8, 'topnbench_copy_width_8'),
+          (32, 'topnbench_copy_width_32'),
+          (128, 'topnbench_copy_width_128'),
+          (256, 'topnbench_copy_width_256'),
+          (512, 'topnbench_copy_width_512'),
+          (1024, 'topnbench_copy_width_1024'))
+     AS w(width_bytes, relation_name)
+CROSS JOIN (VALUES (1, '1pct', 1000),
+                   (2, '25pct', 25000),
+                   (3, '50pct', 50000),
+                   (4, '100pct', 100000))
+     AS l(limit_order, limit_label, limit_rows)
+CROSS JOIN (VALUES ('narrow'), ('wide')) AS s(shape)
+CROSS JOIN LATERAL topnbench_measure(
+    format(
+        CASE s.shape
+            WHEN 'narrow' THEN
+                'SELECT sort_key FROM %1$I ORDER BY sort_key LIMIT %2$s'
+            ELSE
+                'SELECT sort_key, payload FROM %1$I '
+                'ORDER BY sort_key LIMIT %2$s'
+        END,
+        w.relation_name, l.limit_rows),
+    5, '1GB') AS m;
+
+DROP TABLE IF EXISTS topnbench_sort_calibration;
+CREATE TEMP TABLE topnbench_sort_calibration AS
+SELECT width_bytes,
+       limit_order,
+       limit_label,
+       limit_rows,
+       max(estimated_sort_width) FILTER (WHERE shape = 'narrow') AS
+           narrow_plan_width,
+       max(estimated_sort_width) FILTER (WHERE shape = 'wide') AS
+           wide_plan_width,
+       max(total_cost) FILTER (WHERE shape = 'narrow') AS narrow_cost,
+       max(total_cost) FILTER (WHERE shape = 'wide') AS wide_cost,
+       max(median_ms) FILTER (WHERE shape = 'narrow') AS narrow_ms,
+       max(median_ms) FILTER (WHERE shape = 'wide') AS wide_ms,
+       max(sort_space_used_kb) FILTER (WHERE shape = 'narrow') AS narrow_kb,
+       max(sort_space_used_kb) FILTER (WHERE shape = 'wide') AS wide_kb
+FROM topnbench_sort_calibration_raw
+GROUP BY width_bytes, limit_order, limit_label, limit_rows;
+
+-- Four compact calibration rows are printed by default.  A low correlation
+-- or a very early crossover means the constants need more work.
+SELECT limit_label,
+       min(width_bytes) FILTER
+           (WHERE wide_ms > narrow_ms * 1.10) AS first_width_10pct_slower,
+       round(max(wide_ms / NULLIF(narrow_ms, 0))::numeric, 3) AS
+           worst_wide_time_ratio,
+       round(corr(wide_cost - narrow_cost,
+                  wide_ms - narrow_ms)::numeric, 3) AS cost_time_correlation
+FROM topnbench_sort_calibration
+GROUP BY limit_order, limit_label
+ORDER BY limit_order;
+
+\if :topnbench_verbose
+SELECT width_bytes,
+       limit_label,
+       narrow_plan_width,
+       wide_plan_width,
+       round((wide_cost - narrow_cost)::numeric, 3) AS estimated_cost_delta,
+       round(narrow_ms::numeric, 3) AS narrow_ms,
+       round(wide_ms::numeric, 3) AS wide_ms,
+       round((wide_ms - narrow_ms)::numeric, 3) AS actual_ms_delta,
+       round((wide_ms / NULLIF(narrow_ms, 0))::numeric, 3) AS time_ratio,
+       round(narrow_kb::numeric, 0) AS narrow_kb,
+       round(wide_kb::numeric, 0) AS wide_kb
+FROM topnbench_sort_calibration
+ORDER BY limit_order, width_bytes;
+\endif
 
 INSERT INTO topnbench_case_definitions
 SELECT 600 + q.case_offset,
@@ -645,6 +815,7 @@ CROSS JOIN (VALUES (1, '1pct', 1000),
 \echo '== Supplemental phase: repaired width and early-winner controls =='
 
 SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
 INSERT INTO topnbench_supplemental_results
 SELECT 'master', d.case_order, d.phase, d.category, d.case_name, c.*
 FROM topnbench_case_definitions AS d
@@ -655,6 +826,16 @@ WHERE d.phase = 'serial-accurate-width'
 ORDER BY d.case_order;
 
 SET enable_cost_based_delayed_projection = on;
+INSERT INTO topnbench_supplemental_results
+SELECT 'path-only', d.case_order, d.phase, d.category, d.case_name, c.*
+FROM topnbench_case_definitions AS d
+CROSS JOIN LATERAL topnbench_compare(
+    d.auto_query, d.manual_late_query, d.forced_early_query,
+    d.iterations, true, d.work_mem_setting) AS c
+WHERE d.phase = 'serial-accurate-width'
+ORDER BY d.case_order;
+
+SET enable_sort_tuple_width_cost = on;
 INSERT INTO topnbench_supplemental_results
 SELECT 'patched', d.case_order, d.phase, d.category, d.case_name, c.*
 FROM topnbench_case_definitions AS d
@@ -667,13 +848,14 @@ ORDER BY d.case_order;
 RESET max_parallel_workers_per_gather;
 RESET work_mem;
 RESET enable_cost_based_delayed_projection;
+RESET enable_sort_tuple_width_cost;
 
 \echo
 \echo '== Supplemental policy comparison =='
 
 DROP TABLE IF EXISTS topnbench_supplemental_comparison;
 CREATE TEMP TABLE topnbench_supplemental_comparison AS
--- As in the quick matrix, both policy runs establish decision and winner
+-- As in the quick matrix, all policy runs establish decision and winner
 -- stability.  The strategy-to-strategy speedup uses only the POC run's late
 -- and early timings so cache or frequency drift between runs cannot bias it.
 WITH paired AS
@@ -683,8 +865,10 @@ WITH paired AS
            p.category,
            p.case_name,
            m.planner_choice AS master_choice,
+           o.planner_choice AS path_only_choice,
            p.planner_choice AS patched_choice,
            m.actual_winner AS master_actual_winner,
+           o.actual_winner AS path_only_actual_winner,
            p.actual_winner AS patched_actual_winner,
            m.decision_class AS master_decision_class,
            p.decision_class AS patched_decision_class,
@@ -695,11 +879,18 @@ WITH paired AS
            CASE p.planner_choice
                WHEN 'late' THEN p.manual_late_median_ms
                WHEN 'early' THEN p.forced_early_median_ms
-           END AS patched_strategy_ms
+           END AS patched_strategy_ms,
+           CASE o.planner_choice
+               WHEN 'late' THEN p.manual_late_median_ms
+               WHEN 'early' THEN p.forced_early_median_ms
+           END AS path_only_strategy_ms
     FROM topnbench_supplemental_results AS p
     JOIN topnbench_supplemental_results AS m
       ON m.case_name = p.case_name
      AND m.policy = 'master'
+    JOIN topnbench_supplemental_results AS o
+      ON o.case_name = p.case_name
+     AND o.policy = 'path-only'
     WHERE p.policy = 'patched'
 ), classified AS
 (
@@ -722,27 +913,52 @@ WITH paired AS
                WHEN master_choice = patched_actual_winner
                    THEN 'regression'
                ELSE 'inconclusive'
-           END AS patch_effect
+           END AS patch_effect,
+           CASE
+               WHEN path_only_choice IS NULL OR patched_choice IS NULL OR
+                    path_only_choice = 'unknown' OR
+                    patched_choice = 'unknown' OR
+                    path_only_actual_winner = 'tie' OR
+                    patched_actual_winner = 'tie' OR
+                    path_only_actual_winner <> patched_actual_winner
+                   THEN 'inconclusive'
+               WHEN path_only_choice = patched_choice AND
+                    patched_choice = patched_actual_winner
+                   THEN 'unchanged-correct'
+               WHEN path_only_choice = patched_choice
+                   THEN 'unchanged-miss'
+               WHEN patched_choice = patched_actual_winner
+                   THEN 'improvement'
+               WHEN path_only_choice = patched_actual_winner
+                   THEN 'regression'
+               ELSE 'inconclusive'
+           END AS width_cost_effect
     FROM paired
 )
 SELECT classified.*,
        master_strategy_ms / NULLIF(patched_strategy_ms, 0) AS
-           patch_vs_master_speedup
+           patch_vs_master_speedup,
+       path_only_strategy_ms / NULLIF(patched_strategy_ms, 0) AS
+           width_cost_vs_path_only_speedup
 FROM classified;
 
--- Compact per-case result: one row describes both planner policies.
+-- Compact per-case result: one row describes all three planner policies.
+\if :topnbench_verbose
 SELECT category,
        case_name,
        master_choice,
+       path_only_choice,
        patched_choice,
        patched_actual_winner AS actual_winner,
        patch_effect,
+       width_cost_effect,
        round(master_strategy_ms::numeric, 3) AS master_strategy_ms,
        round(patched_strategy_ms::numeric, 3) AS patched_strategy_ms,
        round(patch_vs_master_speedup::numeric, 3) AS
            patch_vs_master_speedup
 FROM topnbench_supplemental_comparison
 ORDER BY case_order;
+\endif
 
 -- Summarize each test category and the complete supplemental suite.
 SELECT CASE WHEN GROUPING(category) = 1 THEN 'ALL' ELSE category END AS category,
@@ -757,6 +973,12 @@ SELECT CASE WHEN GROUPING(category) = 1 THEN 'ALL' ELSE category END AS category
        count(*) FILTER (WHERE patch_effect = 'unchanged-miss') AS
            unchanged_misses,
        count(*) FILTER (WHERE patch_effect = 'inconclusive') AS inconclusive,
+       count(*) FILTER (WHERE path_only_choice <> patched_choice) AS
+           width_cost_changes,
+       count(*) FILTER (WHERE width_cost_effect = 'improvement') AS
+           width_cost_improvements,
+       count(*) FILTER (WHERE width_cost_effect = 'regression') AS
+           width_cost_regressions,
        round(max(CASE WHEN patch_effect = 'improvement'
                       THEN patch_vs_master_speedup END)::numeric, 3) AS
            best_new_speedup,
@@ -774,18 +996,24 @@ WITH all_comparisons AS
 (
     SELECT 'quick'::text AS suite,
            master_choice,
+           path_only_choice,
            patched_choice,
            patched_actual_winner AS actual_winner,
            patch_effect,
-           patch_vs_master_speedup
+           width_cost_effect,
+           patch_vs_master_speedup,
+           width_cost_vs_path_only_speedup
     FROM topnbench_choice_comparison
     UNION ALL
     SELECT 'supplemental',
            master_choice,
+           path_only_choice,
            patched_choice,
            patched_actual_winner,
            patch_effect,
-           patch_vs_master_speedup
+           width_cost_effect,
+           patch_vs_master_speedup,
+           width_cost_vs_path_only_speedup
     FROM topnbench_supplemental_comparison
 )
 SELECT CASE WHEN GROUPING(suite) = 1 THEN 'ALL' ELSE suite END AS suite,
@@ -800,6 +1028,12 @@ SELECT CASE WHEN GROUPING(suite) = 1 THEN 'ALL' ELSE suite END AS suite,
        count(*) FILTER (WHERE patch_effect = 'unchanged-miss') AS
            unchanged_misses,
        count(*) FILTER (WHERE patch_effect = 'inconclusive') AS inconclusive,
+       count(*) FILTER (WHERE path_only_choice <> patched_choice) AS
+           width_cost_changes,
+       count(*) FILTER (WHERE width_cost_effect = 'improvement') AS
+           width_cost_improvements,
+       count(*) FILTER (WHERE width_cost_effect = 'regression') AS
+           width_cost_regressions,
        round(max(CASE WHEN patch_effect = 'improvement'
                       THEN patch_vs_master_speedup END)::numeric, 3) AS
            best_new_speedup,
@@ -810,6 +1044,53 @@ FROM all_comparisons
 GROUP BY GROUPING SETS ((suite), ())
 ORDER BY GROUPING(suite), suite;
 
+\echo
+\echo '== Actionable wrong choices and new regressions =='
+
+WITH actionable AS
+(
+    SELECT 'quick'::text AS suite,
+           'generated'::text AS category,
+           c.case_name,
+           c.path_only_choice,
+           c.patched_choice,
+           c.patched_actual_winner AS actual_winner,
+           c.patch_effect,
+           c.width_cost_effect,
+           p.choice_regression_ratio AS regret
+    FROM topnbench_choice_comparison AS c
+    JOIN topnbench_results AS p USING (case_name)
+    UNION ALL
+    SELECT 'supplemental',
+           c.category,
+           c.case_name,
+           c.path_only_choice,
+           c.patched_choice,
+           c.patched_actual_winner,
+           c.patch_effect,
+           c.width_cost_effect,
+           p.choice_regression_ratio
+    FROM topnbench_supplemental_comparison AS c
+    JOIN topnbench_supplemental_results AS p
+      ON p.case_name = c.case_name
+     AND p.policy = 'patched'
+)
+SELECT suite,
+       category,
+       case_name,
+       path_only_choice,
+       patched_choice,
+       actual_winner,
+       patch_effect,
+       width_cost_effect,
+       round(regret::numeric, 3) AS regret
+FROM actionable
+WHERE patch_effect = 'regression'
+   OR width_cost_effect = 'regression'
+   OR regret >= 1.20
+ORDER BY suite, category, case_name;
+
+\if :topnbench_verbose
 \echo
 \echo '== Candidate path costs for unresolved decisions =='
 
@@ -929,3 +1210,4 @@ JOIN topnbench_supplemental_results AS p
  AND p.policy = 'patched'
 WHERE c.master_choice = 'unknown' OR c.patched_choice = 'unknown'
 ORDER BY c.case_order;
+\endif

@@ -121,13 +121,13 @@
 #define APPEND_CPU_COST_MULTIPLIER 0.5
 
 /*
- * tuplesort copies every input tuple into its own memory context before it
- * can compare or discard the tuple.  Charge one cpu_operator_cost for each
- * approximate 128 bytes copied.  This is intentionally a conservative first
- * estimate; unlike the existing I/O costing, it makes in-memory sort cost
- * sensitive to tuple width.
+ * tuplesort copies every input tuple before it can compare or discard it, but
+ * only the bounded result remains resident in its heap.  Model these as two
+ * separate kinds of memory work.  The constants are deliberately exposed as
+ * named POC calibration points rather than a single fitted divisor.
  */
-#define TUPLESORT_BYTES_PER_COPY_COST 128.0
+#define TUPLESORT_INPUT_BYTES_PER_COPY_COST 1024.0
+#define TUPLESORT_RESIDENT_BYTES_PER_COST 64.0
 
 /*
  * Maximum value for row estimates.  We cap row estimates to this to help
@@ -158,6 +158,7 @@ bool		enable_indexonlyscan = true;
 bool		enable_bitmapscan = true;
 bool		enable_tidscan = true;
 bool		enable_sort = true;
+bool		enable_sort_tuple_width_cost = true;
 bool		enable_incremental_sort = true;
 bool		enable_hashagg = true;
 bool		enable_groupagg = true;
@@ -2041,13 +2042,20 @@ cost_tuplesort(Cost *startup_cost, Cost *run_cost,
 	 * bounded-heap comparison, so even an input tuple that is immediately
 	 * discarded has already been copied.  This work is paid for all input
 	 * tuples, not just the tuples surviving a bounded sort, and must be startup
-	 * cost because Sort consumes its input before returning a row.  The POC GUC
-	 * also gates this term so benchmark runs with it disabled retain upstream
-	 * costing as well as upstream projection placement.
+	 * cost because Sort consumes its input before returning a row.  Retained
+	 * tuples add a second width-sensitive component for allocation and working-
+	 * set pressure.  Cap that component at work_mem for an external sort, whose
+	 * width-dependent I/O is already charged above.
 	 */
-	if (enable_cost_based_delayed_projection)
-		*startup_cost += cpu_operator_cost * input_bytes /
-			TUPLESORT_BYTES_PER_COPY_COST;
+	if (enable_sort_tuple_width_cost)
+	{
+		double		resident_bytes = Min(output_bytes,
+									 (double) sort_mem_bytes);
+
+		*startup_cost += cpu_operator_cost *
+			(input_bytes / TUPLESORT_INPUT_BYTES_PER_COPY_COST +
+			 resident_bytes / TUPLESORT_RESIDENT_BYTES_PER_COST);
+	}
 
 	/*
 	 * Also charge a small amount (arbitrarily set equal to operator cost) per
