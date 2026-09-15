@@ -998,22 +998,57 @@ verify_equivalent(const char *auto_query, const char *manual_query)
 	pfree(sql.data);
 }
 
+/* Shared metadata collection for plan-only calls and untimed warmups. */
+static StrategyResult
+explain_three(const char *auto_query, const char *manual_query,
+			  const char *forced_early_query, bool analyze)
+{
+	StrategyResult result;
+	ExplainResult plan;
+
+	MemSet(&result, 0, sizeof(result));
+	result.auto_timing.minimum = result.auto_timing.median = -1.0;
+	result.manual_timing.minimum = result.manual_timing.median = -1.0;
+	result.forced_early_timing.minimum =
+		result.forced_early_timing.median = -1.0;
+
+	plan = run_explain(auto_query, analyze);
+	result.launched_workers = plan.launched_workers;
+	result.sort_output_columns = plan.sort_output_columns;
+	result.sort_output_signature = plan.sort_output_signature;
+	result.estimated_sort_rows = plan.estimated_sort_rows;
+	result.actual_sort_input_rows = plan.actual_sort_input_rows;
+	result.estimated_sort_width = plan.estimated_sort_width;
+	result.sort_space_used_kb = plan.sort_space_used_kb;
+	result.sort_method = plan.sort_method;
+	result.sort_space_type = plan.sort_space_type;
+	result.nodes = plan.nodes;
+	result.candidates = plan.candidates;
+
+	plan = run_explain(manual_query, analyze);
+	result.manual_late_sort_space_used_kb = plan.sort_space_used_kb;
+	result.manual_late_sort_method = plan.sort_method;
+	result.manual_late_sort_space_type = plan.sort_space_type;
+	result.manual_late_sort_output_signature = plan.sort_output_signature;
+	pfree(plan.nodes);
+
+	plan = run_explain(forced_early_query, analyze);
+	result.forced_early_sort_space_used_kb = plan.sort_space_used_kb;
+	result.forced_early_sort_method = plan.sort_method;
+	result.forced_early_sort_space_type = plan.sort_space_type;
+	result.forced_early_sort_output_signature = plan.sort_output_signature;
+	pfree(plan.nodes);
+
+	return result;
+}
+
 static StrategyResult
 run_three(const char *auto_query, const char *manual_query,
 		  const char *forced_early_query, int iterations, bool verify)
 {
+	const char *queries[] = {auto_query, manual_query, forced_early_query};
+	double	   *times[3];
 	StrategyResult result;
-	double	   *auto_times = palloc_array(double, iterations);
-	double	   *manual_times = palloc_array(double, iterations);
-	double	   *forced_early_times = palloc_array(double, iterations);
-
-	MemSet(&result, 0, sizeof(result));
-	result.estimated_sort_rows = -1.0;
-	result.actual_sort_input_rows = -1.0;
-	result.estimated_sort_width = -1;
-	result.sort_space_used_kb = -1.0;
-	result.manual_late_sort_space_used_kb = -1.0;
-	result.forced_early_sort_space_used_kb = -1.0;
 
 	if (verify)
 	{
@@ -1021,35 +1056,9 @@ run_three(const char *auto_query, const char *manual_query,
 		verify_equivalent(auto_query, forced_early_query);
 	}
 
-	/* Untimed warmup for all three strategies. */
-	{
-		ExplainResult warmup;
-
-		warmup = run_explain(auto_query, true);
-		result.launched_workers = warmup.launched_workers;
-		result.sort_output_columns = warmup.sort_output_columns;
-		result.sort_output_signature = warmup.sort_output_signature;
-		result.estimated_sort_rows = warmup.estimated_sort_rows;
-		result.actual_sort_input_rows = warmup.actual_sort_input_rows;
-		result.estimated_sort_width = warmup.estimated_sort_width;
-		result.sort_space_used_kb = warmup.sort_space_used_kb;
-		result.sort_method = warmup.sort_method;
-		result.sort_space_type = warmup.sort_space_type;
-		result.nodes = warmup.nodes;
-		result.candidates = warmup.candidates;
-		warmup = run_explain(manual_query, true);
-		result.manual_late_sort_space_used_kb = warmup.sort_space_used_kb;
-		result.manual_late_sort_method = warmup.sort_method;
-		result.manual_late_sort_space_type = warmup.sort_space_type;
-		result.manual_late_sort_output_signature = warmup.sort_output_signature;
-		pfree(warmup.nodes);
-		warmup = run_explain(forced_early_query, true);
-		result.forced_early_sort_space_used_kb = warmup.sort_space_used_kb;
-		result.forced_early_sort_method = warmup.sort_method;
-		result.forced_early_sort_space_type = warmup.sort_space_type;
-		result.forced_early_sort_output_signature = warmup.sort_output_signature;
-		pfree(warmup.nodes);
-	}
+	result = explain_three(auto_query, manual_query, forced_early_query, true);
+	for (int k = 0; k < 3; k++)
+		times[k] = palloc_array(double, iterations);
 
 	for (int r = 0; r < iterations; r++)
 	{
@@ -1059,83 +1068,17 @@ run_three(const char *auto_query, const char *manual_query,
 			ExplainResult measured;
 
 			CHECK_FOR_INTERRUPTS();
-			if (which == 0)
-			{
-				measured = run_explain(auto_query, true);
-				auto_times[r] = measured.milliseconds;
-				free_explain_strings(&measured);
-			}
-			else if (which == 1)
-			{
-				measured = run_explain(manual_query, true);
-				manual_times[r] = measured.milliseconds;
-				free_explain_strings(&measured);
-			}
-			else
-			{
-				measured = run_explain(forced_early_query, true);
-				forced_early_times[r] = measured.milliseconds;
-				free_explain_strings(&measured);
-			}
+			measured = run_explain(queries[which], true);
+			times[which][r] = measured.milliseconds;
+			free_explain_strings(&measured);
 		}
 	}
 
-	result.auto_timing = summarize_timings(auto_times, iterations);
-	result.manual_timing = summarize_timings(manual_times, iterations);
-	result.forced_early_timing =
-		summarize_timings(forced_early_times, iterations);
-	pfree(auto_times);
-	pfree(manual_times);
-	pfree(forced_early_times);
-
-	return result;
-}
-
-/*
- * Obtain the three plan shapes without executing any of the queries.  The
- * automatic plan supplies the candidate-path costs; the two rewrites supply
- * only projection signatures used to classify its placement.
- */
-static StrategyResult
-plan_three(const char *auto_query, const char *manual_query,
-		   const char *forced_early_query)
-{
-	StrategyResult result;
-	ExplainResult plan;
-
-	MemSet(&result, 0, sizeof(result));
-	result.estimated_sort_rows = -1.0;
-	result.actual_sort_input_rows = -1.0;
-	result.estimated_sort_width = -1;
-	result.sort_space_used_kb = -1.0;
-	result.manual_late_sort_space_used_kb = -1.0;
-	result.forced_early_sort_space_used_kb = -1.0;
-	result.auto_timing.minimum = result.auto_timing.median = -1.0;
-	result.manual_timing.minimum = result.manual_timing.median = -1.0;
-	result.forced_early_timing.minimum =
-		result.forced_early_timing.median = -1.0;
-
-	plan = run_explain(auto_query, false);
-	result.sort_output_columns = plan.sort_output_columns;
-	result.sort_output_signature = plan.sort_output_signature;
-	result.estimated_sort_rows = plan.estimated_sort_rows;
-	result.estimated_sort_width = plan.estimated_sort_width;
-	result.nodes = plan.nodes;
-	result.candidates = plan.candidates;
-	if (plan.sort_method != NULL)
-		pfree(plan.sort_method);
-	if (plan.sort_space_type != NULL)
-		pfree(plan.sort_space_type);
-
-	plan = run_explain(manual_query, false);
-	result.manual_late_sort_output_signature = plan.sort_output_signature;
-	plan.sort_output_signature = NULL;
-	free_explain_strings(&plan);
-
-	plan = run_explain(forced_early_query, false);
-	result.forced_early_sort_output_signature = plan.sort_output_signature;
-	plan.sort_output_signature = NULL;
-	free_explain_strings(&plan);
+	result.auto_timing = summarize_timings(times[0], iterations);
+	result.manual_timing = summarize_timings(times[1], iterations);
+	result.forced_early_timing = summarize_timings(times[2], iterations);
+	for (int k = 0; k < 3; k++)
+		pfree(times[k]);
 
 	return result;
 }
@@ -1522,8 +1465,8 @@ emit_run_case(FunctionCallInfo fcinfo, const BenchCase *benchcase,
 				  function_name, benchcase, offset_rows, limit_rows, sort_rows);
 
 	if (plan_only)
-		result = plan_three(auto_query.data, manual_query.data,
-						forced_early_query.data);
+		result = explain_three(auto_query.data, manual_query.data,
+							   forced_early_query.data, false);
 	else
 		result = run_three(auto_query.data, manual_query.data,
 					   forced_early_query.data, iterations, verify);
@@ -1828,7 +1771,7 @@ topnbench_compare(PG_FUNCTION_ARGS)
 		}
 		set_local("jit", "off");
 		if (plan_only)
-			result = plan_three(auto_query, manual_query, forced_early_query);
+			result = explain_three(auto_query, manual_query, forced_early_query, false);
 		else
 			result = run_three(auto_query, manual_query, forced_early_query,
 						   iterations, verify);

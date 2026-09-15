@@ -62,6 +62,38 @@ SELECT case_no, case_name, width_bytes, limit_rows, offset_rows, workers,
               expr, relname, limit_rows, offset_rows) AS forced_early_query
 FROM expressions;
 
+ALTER TABLE topnbench_final_cases ADD COLUMN work_mem_setting text DEFAULT '64MB';
+
+-- Reuse the quick matrix's recorded case parameters instead of maintaining a
+-- second copy of its COST/work/target-count definitions.  These four cases
+-- lost a late choice after 0012; measure both policies on the same statements.
+INSERT INTO topnbench_final_cases
+WITH expressions AS (
+    SELECT r.*, x.targets, x.late_targets, x.sort_keys
+    FROM topnbench_results r
+    CROSS JOIN LATERAL (
+        SELECT string_agg(format('topnbench_work_cost_%s(a_random, %s, %s) AS e%s',
+                                 r.declared_cost, r.work_rounds, i, i), ', ' ORDER BY i) AS targets,
+               string_agg(format('topnbench_work_cost_%s(s.k, %s, %s) AS e%s',
+                                 r.declared_cost, r.work_rounds, i, i), ', ' ORDER BY i) AS late_targets,
+               string_agg(format('e%s', i), ', ' ORDER BY i) AS sort_keys
+        FROM generate_series(1, r.target_count) i
+    ) x
+    WHERE r.case_name IN ('cost-1-work-1', 'cost-1-work-16',
+                         'cost-1-work-64', 'limit-90pct')
+)
+SELECT 12 + row_number() OVER (ORDER BY case_name), case_name, NULL::integer,
+       limit_rows, offset_rows, requested_workers,
+       format('SELECT a_random AS k, %s FROM topnbench_data '
+              'ORDER BY a_random LIMIT %s', targets, limit_rows),
+       format('SELECT s.k, %s FROM (SELECT a_random AS k FROM topnbench_data '
+              'ORDER BY a_random LIMIT %s) AS s LIMIT %s',
+              late_targets, sort_rows, limit_rows),
+       format('SELECT a_random AS k, %s FROM topnbench_data '
+              'ORDER BY a_random, %s LIMIT %s', targets, sort_keys, limit_rows),
+       :'topnbench_quick_work_mem'
+FROM expressions;
+
 DROP TABLE IF EXISTS topnbench_final_runs;
 CREATE TEMP TABLE topnbench_final_runs AS
 SELECT 0::integer AS case_no, ''::text AS case_name, 0::integer AS batch,
@@ -70,6 +102,10 @@ FROM topnbench_compare('SELECT 1', 'SELECT 1', 'SELECT 1',
                       1, false, '64MB', true) c
 WITH NO DATA;
 
+DROP TABLE IF EXISTS topnbench_final_plans;
+CREATE TEMP TABLE topnbench_final_plans
+    (case_name text, policy text, plan jsonb, PRIMARY KEY (case_name, policy));
+
 -- SET LOCAL settings expire with this DO statement's transaction.  No trace
 -- logging in timed runs.  Both policies retain the same width-cost formula.
 DO $$
@@ -77,6 +113,8 @@ DECLARE
     c record;
     b integer;
     p text;
+    saved_plan jsonb;
+    saved_messages text := current_setting('client_min_messages');
 BEGIN
     PERFORM set_config('enable_cost_based_delayed_projection', 'on', true);
     PERFORM set_config('enable_sort_tuple_width_cost', 'on', true);
@@ -96,8 +134,29 @@ BEGIN
                 INSERT INTO topnbench_final_runs
                 SELECT c.case_no, c.case_name, b, p, r.*
                 FROM topnbench_compare(c.auto_query, c.manual_late_query,
-                                       c.forced_early_query, 3, b = 1, '64MB') r;
+                                       c.forced_early_query, 3, b = 1,
+                                       c.work_mem_setting) r;
             END LOOP;
+        END LOOP;
+    END LOOP;
+
+    -- Trace the four benefit-loss cases only after ALL timing is finished.
+    -- ORDERED components show inclusive costs and projection target costs;
+    -- the existing FINAL trace then shows LIMIT adjustment and elimination.
+    FOR c IN SELECT * FROM topnbench_final_cases WHERE case_no > 12 ORDER BY case_no LOOP
+        PERFORM set_config('work_mem', c.work_mem_setting, true);
+        PERFORM set_config('max_parallel_workers_per_gather', c.workers::text, true);
+        FOREACH p IN ARRAY ARRAY['0011', '0012'] LOOP
+            PERFORM set_config('enable_projection_total_cost',
+                               CASE p WHEN '0012' THEN 'on' ELSE 'off' END, true);
+            RAISE NOTICE 'topn-trace BEGIN case=% policy=%', c.case_name, p;
+            PERFORM set_config('client_min_messages', 'debug1', true);
+            PERFORM set_config('debug_print_projection_paths', 'on', true);
+            EXECUTE 'EXPLAIN (VERBOSE, COSTS ON, FORMAT JSON) ' || c.auto_query INTO saved_plan;
+            PERFORM set_config('debug_print_projection_paths', 'off', true);
+            PERFORM set_config('client_min_messages', saved_messages, true);
+            RAISE NOTICE 'topn-trace END case=% policy=%', c.case_name, p;
+            INSERT INTO topnbench_final_plans VALUES (c.case_name, p, saved_plan);
         END LOOP;
     END LOOP;
 END $$;
@@ -128,6 +187,35 @@ SELECT case_name, string_agg(DISTINCT old_choice, '/') AS choice_0011,
        round(percentile_cont(0.5) WITHIN GROUP (ORDER BY early_ms)::numeric, 3) AS early_ms,
        min(old_workers) AS min_workers_0011, min(new_workers) AS min_workers_0012
 FROM pairs GROUP BY case_no, case_name ORDER BY case_no;
+
+\echo '== Benefit-loss cases: paired natural-query times (>1 means 0012 is slower) =='
+SELECT o.case_name, o.batch, o.planner_choice AS choice_0011,
+       n.planner_choice AS choice_0012,
+       round(o.auto_median_ms::numeric, 3) AS ms_0011,
+       round(n.auto_median_ms::numeric, 3) AS ms_0012,
+       round((n.auto_median_ms / nullif(o.auto_median_ms, 0))::numeric, 3) AS new_vs_old
+FROM topnbench_final_runs o JOIN topnbench_final_runs n USING (case_no, case_name, batch)
+WHERE o.case_no > 12 AND o.policy = '0011' AND n.policy = '0012'
+ORDER BY o.case_no, o.batch;
+
+\echo '== Benefit-loss cases: ORDERED candidate costs and selected final cost =='
+-- Candidate estimates belong to batch 1; the selected final cost comes from
+-- the untimed EXPLAIN.  The trace is authoritative for each actual tournament.
+SELECT r.case_name, r.policy, r.planner_choice, r.lower_limit_cost_choice,
+       round(r.early_startup_cost::numeric, 3) AS early_startup,
+       round(r.early_total_cost::numeric, 3) AS early_total,
+       round(r.early_limit_cost::numeric, 3) AS early_to_limit,
+       r.early_sort_width,
+       round(r.late_startup_cost::numeric, 3) AS late_startup,
+       round(r.late_total_cost::numeric, 3) AS late_total,
+       round(r.late_limit_cost::numeric, 3) AS late_to_limit,
+       r.late_sort_width,
+       p.plan->0->'Plan'->>'Total Cost' AS selected_total
+FROM topnbench_final_runs r JOIN topnbench_final_plans p USING (case_name, policy)
+WHERE r.batch = 1 ORDER BY r.case_no, r.policy;
+
+SELECT case_name, work_mem_setting, auto_query, manual_late_query, forced_early_query
+FROM topnbench_final_cases WHERE case_no > 12 ORDER BY case_no;
 
 \echo '== Scope guards: plan must stay unchanged =='
 

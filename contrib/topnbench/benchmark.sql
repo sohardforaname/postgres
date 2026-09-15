@@ -51,6 +51,9 @@ ANALYZE topnbench_data;
 \echo
 \echo '== Generated quick matrix: upstream policy versus POC =='
 
+-- Reuse the quick matrix's memory budget in the focused paired rerun.
+SELECT current_setting('work_mem') AS topnbench_quick_work_mem \gset
+
 -- Measure the three execution strategies once, under the full POC.  The
 -- master and path-only passes below use plain EXPLAIN: they contribute only
 -- planner choices, so neither cache order nor CPU-frequency drift can change

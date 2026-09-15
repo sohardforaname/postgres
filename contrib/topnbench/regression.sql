@@ -32,9 +32,12 @@ CREATE TEMP TABLE topnbench_regression_inputs
 );
 
 -- Calls must precede any ANALYZE that would repair deliberately stale stats.
--- Settings changed here are restored both on success and on error.
+-- SET jit establishes a function GUC scope; all local changes below are
+-- restored on both success and error, without replacing caller defaults.
 CREATE OR REPLACE FUNCTION pg_temp.topnbench_diagnose(wanted_case text, source_table regclass)
-RETURNS void LANGUAGE plpgsql AS $fn$
+RETURNS void LANGUAGE plpgsql
+SET jit = off
+AS $fn$
 DECLARE
     d record;
     batch_no integer;
@@ -44,11 +47,7 @@ DECLARE
     strategy_no integer;
     statement text;
     saved_plan jsonb;
-    saved_projection text := current_setting('enable_cost_based_delayed_projection');
-    saved_width text := current_setting('enable_sort_tuple_width_cost');
     saved_mem text := current_setting('work_mem');
-    saved_jit text := current_setting('jit');
-    saved_trace text := current_setting('debug_print_projection_paths');
     saved_messages text := current_setting('client_min_messages');
     policies text[] := ARRAY['master', 'path-only', 'patched'];
     strategies text[] := ARRAY['auto', 'late', 'early'];
@@ -57,7 +56,6 @@ BEGIN
     WHERE case_name = wanted_case;
 
     PERFORM set_config('work_mem', coalesce(d.work_mem_setting, saved_mem), true);
-    PERFORM set_config('jit', 'off', true);
     PERFORM set_config('debug_print_projection_paths', 'off', true);
     EXECUTE format(
         'INSERT INTO topnbench_regression_inputs '
@@ -123,19 +121,5 @@ BEGIN
             VALUES (wanted_case, policy_name, strategies[strategy_no], saved_plan);
         END LOOP;
     END LOOP;
-    PERFORM set_config('enable_cost_based_delayed_projection', saved_projection, true);
-    PERFORM set_config('enable_sort_tuple_width_cost', saved_width, true);
-    PERFORM set_config('work_mem', saved_mem, true);
-    PERFORM set_config('jit', saved_jit, true);
-    PERFORM set_config('debug_print_projection_paths', saved_trace, true);
-    PERFORM set_config('client_min_messages', saved_messages, true);
-EXCEPTION WHEN OTHERS THEN
-    PERFORM set_config('enable_cost_based_delayed_projection', saved_projection, true);
-    PERFORM set_config('enable_sort_tuple_width_cost', saved_width, true);
-    PERFORM set_config('work_mem', saved_mem, true);
-    PERFORM set_config('jit', saved_jit, true);
-    PERFORM set_config('debug_print_projection_paths', saved_trace, true);
-    PERFORM set_config('client_min_messages', saved_messages, true);
-    RAISE;
 END
 $fn$;

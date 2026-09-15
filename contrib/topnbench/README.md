@@ -1,10 +1,28 @@
 # topnbench
 
-## 0011: trace the final path decision
+## 0013: cleanup and benefit-loss diagnostics
 
-Apply 0011 on top of 0010, rebuild/install PostgreSQL, and restart the test
-server.  This patch changes core diagnostics and SQL scripts; the extension C
-interface is unchanged.  The temporary `debug_print_projection_paths` GUC is
+Apply 0013 on top of the functional 0012. Rebuild/install both PostgreSQL and
+topnbench, then restart the server. SQL function signatures are unchanged.
+This patch shares existing sorting and measurement code; it does not change
+the 0012 candidate-selection policy or width-cost coefficients.
+
+The usual `benchmark.sql` entry point now includes four additional paired
+cases: `cost-1-work-1`, `cost-1-work-16`, `cost-1-work-64`, and `limit-90pct`.
+Their expression parameters come from the quick-matrix result rows; their
+`work_mem` is captured before the quick matrix runs. They reuse the same
+four-batch runner as the 12 boundary cases. Labels `0011` and `0012` describe
+the comparison policies, toggled in the same rebuilt backend.
+
+Read `new_vs_old` for the direct natural-query comparison with 0011. The broad
+matrix's `unchanged-miss` is relative to upstream, so it can hide benefits lost
+since 0011. The new section prints per-batch times, candidate costs and exact
+queries for these four cases. It also saves their eight untimed natural-query
+plans in the session's `topnbench_final_plans` table.
+
+## Candidate selection trace
+
+The temporary `debug_print_projection_paths` GUC is
 off by default and does not alter costs, fuzz factors, or path selection.
 
 Run the usual entry point, capturing both output streams:
@@ -15,9 +33,12 @@ psql -X -v ON_ERROR_STOP=1 -f contrib/topnbench/benchmark.sql > topnbench.log 2>
 
 After the timed batches, each of the four regression probes runs one additional
 plan-only natural-query EXPLAIN for each policy.  Only these twelve EXPLAINs
-enable DEBUG1 tracing.  Read the lines between `topn-trace BEGIN/END` markers:
+enable DEBUG1 tracing in that section; the four benefit-loss cases add eight
+more untimed EXPLAINs. Read the `topn-trace BEGIN/END` markers:
 
 * `ordered-surviving`: real ORDERED paths after that stage's hook;
+* `ordered-component`: the unary components of each such candidate, with
+  estimated rows, width, startup/total and target startup/per-tuple costs;
 * `final-proposed`: each path with Limit attached, immediately before add_path;
 * `final-compare`: the actual fuzzy comparison and accept/remove decisions
   between two LimitPaths inside add_path;
@@ -40,10 +61,10 @@ all competitors; `remove_old` describes removal of that particular old path.
 The observer records no paths that were pruned before the ORDERED hook.
 It does not infer a pruning reason merely because two total costs are close.
 
-For the 128-byte boundary case, compare final startup costs as well as final
-total costs: a total-cost difference inside 1% does not mean the startup costs
-are also inside 1%.  The trace is intended to establish where the cheaper
-interpolated candidate disappears, without changing the planner to favor it.
+Component costs include descendants; target costs describe the expressions,
+not an additional charge to add to the path total. Use parent/child differences
+to investigate costing, and follow the final Limit cost without applying its
+fraction twice. `total_only` identifies which comparison policy was used.
 
 `topnbench` is a standalone PostgreSQL benchmark extension for projection
 placement in `ORDER BY ... LIMIT` queries.  It is designed to answer two

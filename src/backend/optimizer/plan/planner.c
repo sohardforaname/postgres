@@ -5773,21 +5773,10 @@ create_ordered_paths(PlannerInfo *root,
 			early_input_path = (Path *)
 				create_projection_path(root, input_path->parent,
 									   input_path, early_target);
-			if (is_sorted)
-				early_sorted_path = early_input_path;
-			else if (presorted_keys == 0 || !enable_incremental_sort)
-				early_sorted_path = (Path *) create_sort_path(root,
-															  ordered_rel,
-															  early_input_path,
-															  root->sort_pathkeys,
-															  limit_tuples);
-			else
-				early_sorted_path = (Path *)
-					create_incremental_sort_path(root, ordered_rel,
-												 early_input_path,
-												 root->sort_pathkeys,
-												 presorted_keys,
-												 limit_tuples);
+			/* The input already passed the path-selection checks above. */
+			early_sorted_path = make_ordered_path(root, ordered_rel,
+												  early_input_path, early_input_path,
+												  root->sort_pathkeys, limit_tuples);
 
 			add_path(ordered_rel, early_sorted_path);
 		}
@@ -5889,19 +5878,9 @@ create_ordered_paths(PlannerInfo *root,
 				early_input_path = (Path *)
 					create_projection_path(root, input_path->parent,
 										   input_path, early_target);
-				if (presorted_keys == 0 || !enable_incremental_sort)
-					early_sorted_path = (Path *) create_sort_path(root,
-																  ordered_rel,
-																  early_input_path,
-																  root->sort_pathkeys,
-																  limit_tuples);
-				else
-					early_sorted_path = (Path *)
-						create_incremental_sort_path(root, ordered_rel,
-													 early_input_path,
-													 root->sort_pathkeys,
-													 presorted_keys,
-													 limit_tuples);
+				early_sorted_path = make_ordered_path(root, ordered_rel,
+													  early_input_path, early_input_path,
+													  root->sort_pathkeys, limit_tuples);
 				total_groups = compute_gather_rows(early_sorted_path);
 				early_sorted_path = (Path *)
 					create_gather_merge_path(root, ordered_rel,
@@ -6032,6 +6011,16 @@ trace_projection_path(PlannerInfo *root, const char *stage, Path *path)
 		if (sort_width < 0 && child != NULL &&
 			(IsA(node, SortPath) || IsA(node, IncrementalSortPath)))
 			sort_width = child->pathtarget->width;
+		/* Inclusive path costs and target costs: never sum these fields. */
+		if (strcmp(stage, "ordered-surviving") == 0)
+			ereport(DEBUG1,
+					(errmsg_internal("topn-path stage=ordered-component ordered_id=%d depth=%d node=%s rows=%.9g width=%d startup=%.12g total=%.12g target_startup=%.12g target_per_tuple=%.12g",
+									 ordered_id, depth, name, node->rows,
+									 node->pathtarget->width,
+									 node->startup_cost, node->total_cost,
+									 node->pathtarget->cost.startup,
+									 node->pathtarget->cost.per_tuple),
+					 errhidecontext(true)));
 		appendStringInfo(&shape, "%s%s", depth ? "/" : "", name);
 		node = child;
 	}
