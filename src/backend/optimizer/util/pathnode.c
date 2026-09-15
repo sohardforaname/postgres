@@ -46,6 +46,9 @@ typedef enum
  */
 #define STD_FUZZ_FACTOR 1.01
 
+static void add_path_internal(RelOptInfo *parent_rel, Path *new_path,
+                              bool total_cost_only);
+
 static int	append_total_cost_compare(const ListCell *a, const ListCell *b);
 static int	append_startup_cost_compare(const ListCell *a, const ListCell *b);
 static List *reparameterize_pathlist_by_child(PlannerInfo *root,
@@ -174,11 +177,13 @@ compare_fractional_path_costs(Path *path1, Path *path2,
  * one of parent->consider_startup and parent->consider_param_startup is false
  * cannot survive comparisons solely on the grounds of good startup cost, so
  * we never return COSTS_DIFFERENT when that is true for the total-cost loser.
- * (But if total costs are fuzzily equal, we compare startup costs anyway,
- * in hopes of eliminating one path or the other.)
+ * With total_cost_only, startup costs are ignored in every branch.
+ * Otherwise, if total costs are fuzzily equal, we compare startup costs anyway,
+ * in hopes of eliminating one path or the other.
  */
 static PathCostComparison
-compare_path_costs_fuzzily(Path *path1, Path *path2, double fuzz_factor)
+compare_path_costs_fuzzily(Path *path1, Path *path2, double fuzz_factor,
+                         bool total_cost_only)
 {
 #define CONSIDER_PATH_STARTUP_COST(p)  \
 	((p)->param_info == NULL ? (p)->parent->consider_startup : (p)->parent->consider_param_startup)
@@ -199,7 +204,7 @@ compare_path_costs_fuzzily(Path *path1, Path *path2, double fuzz_factor)
 	if (path1->total_cost > path2->total_cost * fuzz_factor)
 	{
 		/* path1 fuzzily worse on total cost */
-		if (CONSIDER_PATH_STARTUP_COST(path1) &&
+		if (!total_cost_only && CONSIDER_PATH_STARTUP_COST(path1) &&
 			path2->startup_cost > path1->startup_cost * fuzz_factor)
 		{
 			/* ... but path2 fuzzily worse on startup, so DIFFERENT */
@@ -211,7 +216,7 @@ compare_path_costs_fuzzily(Path *path1, Path *path2, double fuzz_factor)
 	if (path2->total_cost > path1->total_cost * fuzz_factor)
 	{
 		/* path2 fuzzily worse on total cost */
-		if (CONSIDER_PATH_STARTUP_COST(path2) &&
+		if (!total_cost_only && CONSIDER_PATH_STARTUP_COST(path2) &&
 			path1->startup_cost > path2->startup_cost * fuzz_factor)
 		{
 			/* ... but path1 fuzzily worse on startup, so DIFFERENT */
@@ -220,6 +225,10 @@ compare_path_costs_fuzzily(Path *path1, Path *path2, double fuzz_factor)
 		/* else path1 dominates */
 		return COSTS_BETTER1;
 	}
+	/* Complete-result comparisons deliberately ignore startup cost. */
+	if (total_cost_only)
+		return COSTS_EQUAL;
+
 	/* fuzzily the same on total cost ... */
 	if (path1->startup_cost > path2->startup_cost * fuzz_factor)
 	{
@@ -458,6 +467,25 @@ set_cheapest(RelOptInfo *parent_rel)
 void
 add_path(RelOptInfo *parent_rel, Path *new_path)
 {
+	add_path_internal(parent_rel, new_path, false);
+}
+
+/*
+ * Temporary POC entry point for a complete, top-level Limit result.  Use the
+ * ordinary disabled-node, pathkey, row-count and parallel-safety rules, and
+ * the existing fuzz factors, but compare total cost alone.  This applies to
+ * both the first comparison and the tighter tie-break comparison.
+ */
+void
+add_path_with_total_cost(RelOptInfo *parent_rel, Path *new_path)
+{
+	Assert(IsA(new_path, LimitPath));
+	add_path_internal(parent_rel, new_path, true);
+}
+
+static void
+add_path_internal(RelOptInfo *parent_rel, Path *new_path, bool total_cost_only)
+{
 	bool		accept_new = true;	/* unless we find a superior old path */
 	int			insert_at = 0;	/* where to insert new item */
 	List	   *new_path_pathkeys;
@@ -482,14 +510,14 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 		Path	   *old_path = (Path *) lfirst(p1);
 		bool		remove_old = false; /* unless new proves superior */
 		PathCostComparison costcmp;
-		PathKeysComparison keyscmp;
+		PathKeysComparison keyscmp = PATHKEYS_DIFFERENT; /* for tracing */
 		BMS_Comparison outercmp;
 
 		/*
 		 * Do a fuzzy cost comparison with standard fuzziness limit.
 		 */
 		costcmp = compare_path_costs_fuzzily(new_path, old_path,
-											 STD_FUZZ_FACTOR);
+											 STD_FUZZ_FACTOR, total_cost_only);
 
 		/*
 		 * If the two paths compare differently for startup and total cost,
@@ -564,7 +592,7 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 									accept_new = false; /* old dominates new */
 								else if (compare_path_costs_fuzzily(new_path,
 																	old_path,
-																	1.0000000001) == COSTS_BETTER1)
+																	1.0000000001, total_cost_only) == COSTS_BETTER1)
 									remove_old = true;	/* new dominates old */
 								else
 									accept_new = false; /* old equals or
@@ -615,6 +643,21 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 				}
 			}
 		}
+
+		/* Temporary POC observer: report the actual final-Limit tournament. */
+		if (debug_print_projection_paths &&
+			parent_rel->reloptkind == RELOPT_UPPER_REL &&
+			IsA(new_path, LimitPath) && IsA(old_path, LimitPath))
+			ereport(DEBUG1,
+					(errmsg_internal("topn-path final-compare total_only=%d new_startup=%.12g new_total=%.12g old_startup=%.12g old_total=%.12g fuzzy=%s keys=%d accept_new=%d remove_old=%d",
+								 total_cost_only, new_path->startup_cost, new_path->total_cost,
+								 old_path->startup_cost, old_path->total_cost,
+								 costcmp == COSTS_EQUAL ? "equal" :
+								 costcmp == COSTS_BETTER1 ? "new-better" :
+								 costcmp == COSTS_BETTER2 ? "old-better" : "different",
+								 costcmp == COSTS_DIFFERENT ? -1 : (int) keyscmp,
+								 accept_new, remove_old),
+					 errhidecontext(true)));
 
 		/*
 		 * Remove current element from pathlist if dominated by new.
@@ -831,7 +874,7 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 			 * Do a fuzzy cost comparison with standard fuzziness limit.
 			 */
 			costcmp = compare_path_costs_fuzzily(new_path, old_path,
-												 STD_FUZZ_FACTOR);
+												 STD_FUZZ_FACTOR, false);
 			if (costcmp == COSTS_BETTER1)
 			{
 				if (keyscmp != PATHKEYS_BETTER2)
@@ -849,7 +892,7 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 				else if (keyscmp == PATHKEYS_BETTER2)
 					accept_new = false;
 				else if (compare_path_costs_fuzzily(new_path, old_path,
-													1.0000000001) == COSTS_BETTER1)
+													1.0000000001, false) == COSTS_BETTER1)
 					remove_old = true;
 				else
 					accept_new = false;

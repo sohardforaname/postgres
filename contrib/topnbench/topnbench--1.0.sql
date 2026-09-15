@@ -20,7 +20,8 @@ CREATE FUNCTION topnbench_run(
     key_column name DEFAULT 'a',
     iterations integer DEFAULT 3,
     profile text DEFAULT 'quick',
-    verify boolean DEFAULT true)
+    verify boolean DEFAULT true,
+    plan_only boolean DEFAULT false)
 RETURNS TABLE (
     case_name text,
     input_rows bigint,
@@ -91,7 +92,8 @@ CREATE FUNCTION topnbench_compare(
     forced_early_query text,
     iterations integer DEFAULT 5,
     verify boolean DEFAULT true,
-    work_mem_setting text DEFAULT NULL)
+    work_mem_setting text DEFAULT NULL,
+    plan_only boolean DEFAULT false)
 RETURNS TABLE (
     auto_plan_nodes text,
     launched_workers integer,
@@ -160,11 +162,11 @@ RETURNS TABLE (
 AS 'MODULE_PATHNAME', 'topnbench_measure'
 LANGUAGE C VOLATILE PARALLEL UNSAFE;
 
-COMMENT ON FUNCTION topnbench_run(regclass, name, integer, text, boolean) IS
-'Measure delayed-projection decision quality over a curated case matrix.';
+COMMENT ON FUNCTION topnbench_run(regclass, name, integer, text, boolean, boolean) IS
+'Measure delayed-projection decision quality over a curated case matrix, or collect plans without execution when plan_only is true.';
 
-COMMENT ON FUNCTION topnbench_compare(text, text, text, integer, boolean, text) IS
-'Compare automatic, manually delayed, and forced-early SELECT statements, optionally under a specified work_mem, rotating execution order and reporting minimum and median execution times.';
+COMMENT ON FUNCTION topnbench_compare(text, text, text, integer, boolean, text, boolean) IS
+'Compare automatic, manually delayed, and forced-early SELECT statements, optionally under a specified work_mem; plan_only collects decisions without executing the statements.';
 
 COMMENT ON FUNCTION topnbench_measure(text, integer, text) IS
 'Measure one SELECT and report root cost, Sort metadata, and execution time.';

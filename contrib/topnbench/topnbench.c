@@ -887,17 +887,23 @@ copy_strategy_strings_to_upper_context(StrategyResult *result)
 }
 
 static ExplainResult
-run_explain(const char *query)
+run_explain(const char *query, bool analyze)
 {
 	ExplainResult result;
 	StringInfoData sql;
 	char	   *json;
 	int			rc;
 
+	MemSet(&result, 0, sizeof(result));
+	result.milliseconds = -1.0;
 	initStringInfo(&sql);
-	appendStringInfo(&sql,
-					 "EXPLAIN (ANALYZE, VERBOSE, COSTS ON, TIMING OFF, "
-					 "SUMMARY ON, FORMAT JSON) %s", query);
+	if (analyze)
+		appendStringInfo(&sql,
+						 "EXPLAIN (ANALYZE, VERBOSE, COSTS ON, TIMING OFF, "
+						 "SUMMARY ON, FORMAT JSON) %s", query);
+	else
+		appendStringInfo(&sql,
+						 "EXPLAIN (VERBOSE, COSTS ON, FORMAT JSON) %s", query);
 
 	MemSet(&captured_candidate_costs, 0, sizeof(captured_candidate_costs));
 	capture_candidate_costs = true;
@@ -915,7 +921,7 @@ run_explain(const char *query)
 		ereport(ERROR, (errmsg("benchmark EXPLAIN returned NULL")));
 
 	result.milliseconds = extract_json_double(json, "\"Execution Time\"", -1.0);
-	if (result.milliseconds < 0)
+	if (analyze && result.milliseconds < 0)
 		ereport(ERROR, (errmsg("could not read Execution Time from EXPLAIN JSON")));
 	result.startup_cost = extract_json_double(json, "\"Startup Cost\"", -1.0);
 	result.total_cost = extract_json_double(json, "\"Total Cost\"", -1.0);
@@ -1001,6 +1007,14 @@ run_three(const char *auto_query, const char *manual_query,
 	double	   *manual_times = palloc_array(double, iterations);
 	double	   *forced_early_times = palloc_array(double, iterations);
 
+	MemSet(&result, 0, sizeof(result));
+	result.estimated_sort_rows = -1.0;
+	result.actual_sort_input_rows = -1.0;
+	result.estimated_sort_width = -1;
+	result.sort_space_used_kb = -1.0;
+	result.manual_late_sort_space_used_kb = -1.0;
+	result.forced_early_sort_space_used_kb = -1.0;
+
 	if (verify)
 	{
 		verify_equivalent(auto_query, manual_query);
@@ -1011,7 +1025,7 @@ run_three(const char *auto_query, const char *manual_query,
 	{
 		ExplainResult warmup;
 
-		warmup = run_explain(auto_query);
+		warmup = run_explain(auto_query, true);
 		result.launched_workers = warmup.launched_workers;
 		result.sort_output_columns = warmup.sort_output_columns;
 		result.sort_output_signature = warmup.sort_output_signature;
@@ -1023,13 +1037,13 @@ run_three(const char *auto_query, const char *manual_query,
 		result.sort_space_type = warmup.sort_space_type;
 		result.nodes = warmup.nodes;
 		result.candidates = warmup.candidates;
-		warmup = run_explain(manual_query);
+		warmup = run_explain(manual_query, true);
 		result.manual_late_sort_space_used_kb = warmup.sort_space_used_kb;
 		result.manual_late_sort_method = warmup.sort_method;
 		result.manual_late_sort_space_type = warmup.sort_space_type;
 		result.manual_late_sort_output_signature = warmup.sort_output_signature;
 		pfree(warmup.nodes);
-		warmup = run_explain(forced_early_query);
+		warmup = run_explain(forced_early_query, true);
 		result.forced_early_sort_space_used_kb = warmup.sort_space_used_kb;
 		result.forced_early_sort_method = warmup.sort_method;
 		result.forced_early_sort_space_type = warmup.sort_space_type;
@@ -1047,19 +1061,19 @@ run_three(const char *auto_query, const char *manual_query,
 			CHECK_FOR_INTERRUPTS();
 			if (which == 0)
 			{
-				measured = run_explain(auto_query);
+				measured = run_explain(auto_query, true);
 				auto_times[r] = measured.milliseconds;
 				free_explain_strings(&measured);
 			}
 			else if (which == 1)
 			{
-				measured = run_explain(manual_query);
+				measured = run_explain(manual_query, true);
 				manual_times[r] = measured.milliseconds;
 				free_explain_strings(&measured);
 			}
 			else
 			{
-				measured = run_explain(forced_early_query);
+				measured = run_explain(forced_early_query, true);
 				forced_early_times[r] = measured.milliseconds;
 				free_explain_strings(&measured);
 			}
@@ -1073,6 +1087,55 @@ run_three(const char *auto_query, const char *manual_query,
 	pfree(auto_times);
 	pfree(manual_times);
 	pfree(forced_early_times);
+
+	return result;
+}
+
+/*
+ * Obtain the three plan shapes without executing any of the queries.  The
+ * automatic plan supplies the candidate-path costs; the two rewrites supply
+ * only projection signatures used to classify its placement.
+ */
+static StrategyResult
+plan_three(const char *auto_query, const char *manual_query,
+		   const char *forced_early_query)
+{
+	StrategyResult result;
+	ExplainResult plan;
+
+	MemSet(&result, 0, sizeof(result));
+	result.estimated_sort_rows = -1.0;
+	result.actual_sort_input_rows = -1.0;
+	result.estimated_sort_width = -1;
+	result.sort_space_used_kb = -1.0;
+	result.manual_late_sort_space_used_kb = -1.0;
+	result.forced_early_sort_space_used_kb = -1.0;
+	result.auto_timing.minimum = result.auto_timing.median = -1.0;
+	result.manual_timing.minimum = result.manual_timing.median = -1.0;
+	result.forced_early_timing.minimum =
+		result.forced_early_timing.median = -1.0;
+
+	plan = run_explain(auto_query, false);
+	result.sort_output_columns = plan.sort_output_columns;
+	result.sort_output_signature = plan.sort_output_signature;
+	result.estimated_sort_rows = plan.estimated_sort_rows;
+	result.estimated_sort_width = plan.estimated_sort_width;
+	result.nodes = plan.nodes;
+	result.candidates = plan.candidates;
+	if (plan.sort_method != NULL)
+		pfree(plan.sort_method);
+	if (plan.sort_space_type != NULL)
+		pfree(plan.sort_space_type);
+
+	plan = run_explain(manual_query, false);
+	result.manual_late_sort_output_signature = plan.sort_output_signature;
+	plan.sort_output_signature = NULL;
+	free_explain_strings(&plan);
+
+	plan = run_explain(forced_early_query, false);
+	result.forced_early_sort_output_signature = plan.sort_output_signature;
+	plan.sort_output_signature = NULL;
+	free_explain_strings(&plan);
 
 	return result;
 }
@@ -1422,7 +1485,7 @@ set_candidate_cost_values(Datum *values, bool *nulls, int start,
 static void
 emit_run_case(FunctionCallInfo fcinfo, const BenchCase *benchcase,
 			  int64 nrows, const char *relation_name, const char *column_name,
-			  int iterations, bool verify)
+			  int iterations, bool verify, bool plan_only)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	StringInfoData auto_query;
@@ -1458,21 +1521,28 @@ emit_run_case(FunctionCallInfo fcinfo, const BenchCase *benchcase,
 				  relation_name, column_name,
 				  function_name, benchcase, offset_rows, limit_rows, sort_rows);
 
-	result = run_three(auto_query.data, manual_query.data,
-				   forced_early_query.data, iterations, verify);
+	if (plan_only)
+		result = plan_three(auto_query.data, manual_query.data,
+						forced_early_query.data);
+	else
+		result = run_three(auto_query.data, manual_query.data,
+					   forced_early_query.data, iterations, verify);
 	planner_choice = projection_choice(&result);
-	winner = actual_winner(result.manual_timing.median,
-						   result.forced_early_timing.median);
+	winner = plan_only ? NULL :
+		actual_winner(result.manual_timing.median,
+					  result.forced_early_timing.median);
 	cost_choice = model_choice((double) benchcase->expression_steps *
 						   (double) benchcase->declared_cost,
 						   nrows, sort_rows);
 	structural_choice = model_choice((double) benchcase->expression_steps,
 								 nrows, sort_rows);
-	best_ms = Min(result.manual_timing.median,
-				  result.forced_early_timing.median);
-	choice_regression = choice_regression_ratio(planner_choice,
-										 result.manual_timing.median,
-										 result.forced_early_timing.median);
+	best_ms = plan_only ? -1.0 :
+		Min(result.manual_timing.median,
+			result.forced_early_timing.median);
+	choice_regression = plan_only ? -1.0 :
+		choice_regression_ratio(planner_choice,
+							result.manual_timing.median,
+							result.forced_early_timing.median);
 
 	values[0] = CStringGetTextDatum(benchcase->name);
 	values[1] = Int64GetDatum(nrows);
@@ -1486,7 +1556,10 @@ emit_run_case(FunctionCallInfo fcinfo, const BenchCase *benchcase,
 	values[9] = Int32GetDatum(benchcase->declared_cost);
 	values[10] = Int32GetDatum(benchcase->work_rounds);
 	values[11] = Int32GetDatum(benchcase->workers);
-	values[12] = Int32GetDatum(result.launched_workers);
+	if (plan_only)
+		nulls[12] = true;
+	else
+		values[12] = Int32GetDatum(result.launched_workers);
 	values[13] = CStringGetTextDatum(result.nodes);
 	if (result.estimated_sort_rows < 0.0)
 		nulls[14] = true;
@@ -1496,7 +1569,7 @@ emit_run_case(FunctionCallInfo fcinfo, const BenchCase *benchcase,
 		nulls[15] = true;
 	else
 		values[15] = Float8GetDatum(result.actual_sort_input_rows);
-	if (result.launched_workers > 0 ||
+	if (plan_only || result.launched_workers > 0 ||
 		result.estimated_sort_rows <= 0.0 ||
 		result.actual_sort_input_rows < 0.0)
 		nulls[16] = true;
@@ -1520,25 +1593,39 @@ emit_run_case(FunctionCallInfo fcinfo, const BenchCase *benchcase,
 	else
 		values[20] = Float8GetDatum(result.sort_space_used_kb);
 	values[21] = CStringGetTextDatum(planner_choice);
-	values[22] = Float8GetDatum(result.auto_timing.minimum);
-	values[23] = Float8GetDatum(result.auto_timing.median);
-	values[24] = Float8GetDatum(result.manual_timing.minimum);
-	values[25] = Float8GetDatum(result.manual_timing.median);
-	values[26] = Float8GetDatum(result.forced_early_timing.minimum);
-	values[27] = Float8GetDatum(result.forced_early_timing.median);
-	values[28] = CStringGetTextDatum(winner);
-	set_correctness(&values[29], &nulls[29], planner_choice, winner);
-	values[30] = Float8GetDatum(result.auto_timing.median / best_ms);
-	if (choice_regression < 0)
-		nulls[31] = true;
+	if (plan_only)
+	{
+		for (int i = 22; i <= 32; i++)
+			nulls[i] = true;
+	}
 	else
-		values[31] = Float8GetDatum(choice_regression);
-	values[32] = Float8GetDatum(result.forced_early_timing.median /
-								result.manual_timing.median);
+	{
+		values[22] = Float8GetDatum(result.auto_timing.minimum);
+		values[23] = Float8GetDatum(result.auto_timing.median);
+		values[24] = Float8GetDatum(result.manual_timing.minimum);
+		values[25] = Float8GetDatum(result.manual_timing.median);
+		values[26] = Float8GetDatum(result.forced_early_timing.minimum);
+		values[27] = Float8GetDatum(result.forced_early_timing.median);
+		values[28] = CStringGetTextDatum(winner);
+		set_correctness(&values[29], &nulls[29], planner_choice, winner);
+		values[30] = Float8GetDatum(result.auto_timing.median / best_ms);
+		if (choice_regression < 0)
+			nulls[31] = true;
+		else
+			values[31] = Float8GetDatum(choice_regression);
+		values[32] = Float8GetDatum(result.forced_early_timing.median /
+									result.manual_timing.median);
+	}
 	values[33] = CStringGetTextDatum(cost_choice);
-	set_correctness(&values[34], &nulls[34], cost_choice, winner);
+	if (plan_only)
+		nulls[34] = true;
+	else
+		set_correctness(&values[34], &nulls[34], cost_choice, winner);
 	values[35] = CStringGetTextDatum(structural_choice);
-	set_correctness(&values[36], &nulls[36], structural_choice, winner);
+	if (plan_only)
+		nulls[36] = true;
+	else
+		set_correctness(&values[36], &nulls[36], structural_choice, winner);
 	if (result.manual_late_sort_method == NULL)
 		nulls[37] = true;
 	else
@@ -1563,7 +1650,10 @@ emit_run_case(FunctionCallInfo fcinfo, const BenchCase *benchcase,
 		nulls[42] = true;
 	else
 		values[42] = Float8GetDatum(result.forced_early_sort_space_used_kb);
-	values[43] = CStringGetTextDatum(decision_class(planner_choice, winner));
+	if (plan_only)
+		nulls[43] = true;
+	else
+		values[43] = CStringGetTextDatum(decision_class(planner_choice, winner));
 	if (result.sort_output_signature == NULL)
 		nulls[44] = true;
 	else
@@ -1615,6 +1705,8 @@ topnbench_run(PG_FUNCTION_ARGS)
 	int			iterations = PG_GETARG_INT32(2);
 	char	   *profile = text_to_cstring(PG_GETARG_TEXT_PP(3));
 	bool		verify = PG_GETARG_BOOL(4);
+	bool		plan_only =
+		PG_NARGS() > 5 && !PG_ARGISNULL(5) && PG_GETARG_BOOL(5);
 	char	   *relname;
 	char	   *nspname;
 	char	   *qualified_relation;
@@ -1663,13 +1755,15 @@ topnbench_run(PG_FUNCTION_ARGS)
 
 		for (int i = 0; i < lengthof(quick_cases); i++)
 			emit_run_case(fcinfo, &quick_cases[i], nrows,
-						  qualified_relation, quoted_column, iterations, verify);
+						  qualified_relation, quoted_column, iterations, verify,
+						  plan_only);
 
 		if (strcmp(profile, "confidence") == 0)
 		{
 			for (int i = 0; i < lengthof(confidence_extra_cases); i++)
 				emit_run_case(fcinfo, &confidence_extra_cases[i], nrows,
-							  qualified_relation, quoted_column, iterations, verify);
+								  qualified_relation, quoted_column, iterations, verify,
+								  plan_only);
 		}
 	}
 	PG_CATCH();
@@ -1698,6 +1792,8 @@ topnbench_compare(PG_FUNCTION_ARGS)
 	char	   *work_mem_setting =
 		(PG_NARGS() > 5 && !PG_ARGISNULL(5)) ?
 		text_to_cstring(PG_GETARG_TEXT_PP(5)) : NULL;
+	bool		plan_only =
+		PG_NARGS() > 6 && !PG_ARGISNULL(6) && PG_GETARG_BOOL(6);
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	StrategyResult result;
 	Datum		values[44];
@@ -1731,8 +1827,11 @@ topnbench_compare(PG_FUNCTION_ARGS)
 			pfree(quoted);
 		}
 		set_local("jit", "off");
-		result = run_three(auto_query, manual_query, forced_early_query,
-					   iterations, verify);
+		if (plan_only)
+			result = plan_three(auto_query, manual_query, forced_early_query);
+		else
+			result = run_three(auto_query, manual_query, forced_early_query,
+						   iterations, verify);
 		copy_strategy_strings_to_upper_context(&result);
 	}
 	PG_CATCH();
@@ -1748,16 +1847,22 @@ topnbench_compare(PG_FUNCTION_ARGS)
 		elog(ERROR, "SPI_finish failed");
 
 	planner_choice = projection_choice(&result);
-	winner = actual_winner(result.manual_timing.median,
-						   result.forced_early_timing.median);
-	best_ms = Min(result.manual_timing.median,
-				  result.forced_early_timing.median);
-	choice_regression = choice_regression_ratio(planner_choice,
-										 result.manual_timing.median,
-										 result.forced_early_timing.median);
+	winner = plan_only ? NULL :
+		actual_winner(result.manual_timing.median,
+					  result.forced_early_timing.median);
+	best_ms = plan_only ? -1.0 :
+		Min(result.manual_timing.median,
+			result.forced_early_timing.median);
+	choice_regression = plan_only ? -1.0 :
+		choice_regression_ratio(planner_choice,
+							result.manual_timing.median,
+							result.forced_early_timing.median);
 
 	values[0] = CStringGetTextDatum(result.nodes);
-	values[1] = Int32GetDatum(result.launched_workers);
+	if (plan_only)
+		nulls[1] = true;
+	else
+		values[1] = Int32GetDatum(result.launched_workers);
 	if (result.estimated_sort_rows < 0.0)
 		nulls[2] = true;
 	else
@@ -1766,7 +1871,7 @@ topnbench_compare(PG_FUNCTION_ARGS)
 		nulls[3] = true;
 	else
 		values[3] = Float8GetDatum(result.actual_sort_input_rows);
-	if (result.launched_workers > 0 ||
+	if (plan_only || result.launched_workers > 0 ||
 		result.estimated_sort_rows <= 0.0 ||
 		result.actual_sort_input_rows < 0.0)
 		nulls[4] = true;
@@ -1790,21 +1895,29 @@ topnbench_compare(PG_FUNCTION_ARGS)
 	else
 		values[8] = Float8GetDatum(result.sort_space_used_kb);
 	values[9] = CStringGetTextDatum(planner_choice);
-	values[10] = Float8GetDatum(result.auto_timing.minimum);
-	values[11] = Float8GetDatum(result.auto_timing.median);
-	values[12] = Float8GetDatum(result.manual_timing.minimum);
-	values[13] = Float8GetDatum(result.manual_timing.median);
-	values[14] = Float8GetDatum(result.forced_early_timing.minimum);
-	values[15] = Float8GetDatum(result.forced_early_timing.median);
-	values[16] = CStringGetTextDatum(winner);
-	set_correctness(&values[17], &nulls[17], planner_choice, winner);
-	values[18] = Float8GetDatum(result.auto_timing.median / best_ms);
-	if (choice_regression < 0)
-		nulls[19] = true;
+	if (plan_only)
+	{
+		for (int i = 10; i <= 20; i++)
+			nulls[i] = true;
+	}
 	else
-		values[19] = Float8GetDatum(choice_regression);
-	values[20] = Float8GetDatum(result.forced_early_timing.median /
-								result.manual_timing.median);
+	{
+		values[10] = Float8GetDatum(result.auto_timing.minimum);
+		values[11] = Float8GetDatum(result.auto_timing.median);
+		values[12] = Float8GetDatum(result.manual_timing.minimum);
+		values[13] = Float8GetDatum(result.manual_timing.median);
+		values[14] = Float8GetDatum(result.forced_early_timing.minimum);
+		values[15] = Float8GetDatum(result.forced_early_timing.median);
+		values[16] = CStringGetTextDatum(winner);
+		set_correctness(&values[17], &nulls[17], planner_choice, winner);
+		values[18] = Float8GetDatum(result.auto_timing.median / best_ms);
+		if (choice_regression < 0)
+			nulls[19] = true;
+		else
+			values[19] = Float8GetDatum(choice_regression);
+		values[20] = Float8GetDatum(result.forced_early_timing.median /
+									result.manual_timing.median);
+	}
 	if (result.manual_late_sort_method == NULL)
 		nulls[21] = true;
 	else
@@ -1829,7 +1942,10 @@ topnbench_compare(PG_FUNCTION_ARGS)
 		nulls[26] = true;
 	else
 		values[26] = Float8GetDatum(result.forced_early_sort_space_used_kb);
-	values[27] = CStringGetTextDatum(decision_class(planner_choice, winner));
+	if (plan_only)
+		nulls[27] = true;
+	else
+		values[27] = CStringGetTextDatum(decision_class(planner_choice, winner));
 	if (result.sort_output_signature == NULL)
 		nulls[28] = true;
 	else
@@ -1915,7 +2031,7 @@ topnbench_measure(PG_FUNCTION_ARGS)
 		}
 		set_local("jit", "off");
 
-		warmup = run_explain(query);
+		warmup = run_explain(query, true);
 		nodes = spi_pstrdup_nullable(warmup.nodes);
 		sort_method = spi_pstrdup_nullable(warmup.sort_method);
 		sort_space_type = spi_pstrdup_nullable(warmup.sort_space_type);
@@ -1926,7 +2042,7 @@ topnbench_measure(PG_FUNCTION_ARGS)
 			ExplainResult measured;
 
 			CHECK_FOR_INTERRUPTS();
-			measured = run_explain(query);
+			measured = run_explain(query, true);
 			times[i] = measured.milliseconds;
 			free_explain_strings(&measured);
 		}

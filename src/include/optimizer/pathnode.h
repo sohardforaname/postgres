@@ -56,6 +56,7 @@ extern int	compare_fractional_path_costs(Path *path1, Path *path2,
 										  double fraction);
 extern void set_cheapest(RelOptInfo *parent_rel);
 extern void add_path(RelOptInfo *parent_rel, Path *new_path);
+extern void add_path_with_total_cost(RelOptInfo *parent_rel, Path *new_path);
 extern bool add_path_precheck(RelOptInfo *parent_rel, int disabled_nodes,
 							  Cost startup_cost, Cost total_cost,
 							  List *pathkeys, Relids required_outer);

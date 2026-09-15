@@ -102,6 +102,8 @@ typedef enum
 extern PGDLLIMPORT int debug_parallel_query;
 extern PGDLLIMPORT bool parallel_leader_participation;
 extern PGDLLIMPORT bool enable_cost_based_delayed_projection;
+extern PGDLLIMPORT bool enable_projection_total_cost;
+extern PGDLLIMPORT bool debug_print_projection_paths;
 extern PGDLLIMPORT bool enable_distinct_reordering;
 
 extern PlannedStmt *planner(Query *parse, const char *query_string,

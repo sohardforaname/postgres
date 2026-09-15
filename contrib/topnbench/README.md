@@ -1,5 +1,50 @@
 # topnbench
 
+## 0011: trace the final path decision
+
+Apply 0011 on top of 0010, rebuild/install PostgreSQL, and restart the test
+server.  This patch changes core diagnostics and SQL scripts; the extension C
+interface is unchanged.  The temporary `debug_print_projection_paths` GUC is
+off by default and does not alter costs, fuzz factors, or path selection.
+
+Run the usual entry point, capturing both output streams:
+
+```sh
+psql -X -v ON_ERROR_STOP=1 -f contrib/topnbench/benchmark.sql > topnbench.log 2>&1
+```
+
+After the timed batches, each of the four regression probes runs one additional
+plan-only natural-query EXPLAIN for each policy.  Only these twelve EXPLAINs
+enable DEBUG1 tracing.  Read the lines between `topn-trace BEGIN/END` markers:
+
+* `ordered-surviving`: real ORDERED paths after that stage's hook;
+* `final-proposed`: each path with Limit attached, immediately before add_path;
+* `final-compare`: the actual fuzzy comparison and accept/remove decisions
+  between two LimitPaths inside add_path;
+* `final-surviving`: paths remaining after the FINAL-stage hook;
+* `selected`: the exact best_path passed to create_plan, after initPlan costs
+  and set_cheapest.  The preceding line prints the actual selection fraction.
+
+`ordered_id` links a final path to its ORDERED ancestor within that one planning
+run (zero means unmatched).  It is not comparable between queries.  Shapes are
+Path shapes, so a Projection may later be absorbed into a scan plan.  `Other`
+ends the bounded unary walk; it is not a failed placement classification.
+Startup/total values on a final path already include Limit/OFFSET adjustments;
+do not interpolate or apply the LIMIT fraction a second time.
+
+In `final-compare`, `fuzzy` names the result at the existing 1.01 fuzz factor.
+`keys` is the PathKeysComparison enum (0 equal, 1 new better, 2 old better,
+3 different); -1 means cost comparison skipped the key comparison.
+`accept_new` describes that pair's decision, not necessarily the result after
+all competitors; `remove_old` describes removal of that particular old path.
+The observer records no paths that were pruned before the ORDERED hook.
+It does not infer a pruning reason merely because two total costs are close.
+
+For the 128-byte boundary case, compare final startup costs as well as final
+total costs: a total-cost difference inside 1% does not mean the startup costs
+are also inside 1%.  The trace is intended to establish where the cheaper
+interpolated candidate disappears, without changing the planner to favor it.
+
 `topnbench` is a standalone PostgreSQL benchmark extension for projection
 placement in `ORDER BY ... LIMIT` queries.  It is designed to answer two
 different questions:
@@ -32,9 +77,11 @@ tables.  The POC patch provides temporary
 - `patched`: both features on.
 
 This separates the effect of constructing two competing projection paths from
-the effect of the new Sort cost, using one backend without cross-build timing
-noise.  Both GUCs are development aids and are not intended for a commit-ready
-patch.
+the effect of the new Sort cost.  The master and path-only policies use plain
+`EXPLAIN`; only the patched policy executes the three strategies.  Consequently
+every case has one measured winner, and all three planner decisions are scored
+against exactly the same timings.  Both GUCs are development aids and are not
+intended for a commit-ready patch.
 
 The extension script must be named `topnbench--1.0.sql` because PostgreSQL's
 extension loader requires a versioned installation script.  That is only the
@@ -53,10 +100,14 @@ Every case compares three equivalent statements:
   their evaluation below Sort without changing the order established by the
   unique leading key.
 
-Before timing, `EXCEPT ALL` verifies that all three statements return the same
-multiset.  Each statement gets an untimed warmup.  Timed executions use a
-rotating order, and both minimum and median executor time are reported from
-`EXPLAIN (ANALYZE, VERBOSE, TIMING OFF, FORMAT JSON)`.
+Before the patched-policy timing pass, `EXCEPT ALL` verifies that all three
+statements return the same multiset.  Each statement gets an untimed warmup.
+Timed executions use a rotating order, and both minimum and median executor
+time are reported from
+`EXPLAIN (ANALYZE, VERBOSE, TIMING OFF, FORMAT JSON)`.  A `plan_only` argument
+is available on `topnbench_run()` and `topnbench_compare()` for the two policy
+passes that need decisions but no execution; all execution-only output columns
+are NULL in that mode.
 
 The first Sort node's complete, whitespace-normalized `Output` array is
 compared with the corresponding arrays from the manual-late and forced-early
@@ -196,15 +247,45 @@ obvious.
 Both `topnbench_choice_comparison` and
 `topnbench_supplemental_comparison` classify each upstream-versus-POC decision
 as `improvement`, `regression`, `unchanged-correct`, `unchanged-miss`, or
-`inconclusive`.  A case is inconclusive when either plan cannot be classified,
-either run reports a tie, or the measured winner changes between the two runs.
-Strategy speedups use the late and early timings from the POC run, so both
-choices are compared under the same run conditions.
-The same tables contain `width_cost_effect`, which performs the identical
-classification between `path-only` and `patched`.  This is the direct answer
-to whether the width term improved or regressed a decision.
+`inconclusive`.  A case is inconclusive when a plan cannot be classified or the
+single measured winner is a tie.  Strategy speedups use the late and early
+timings from the patched run, so every choice is compared under the same run
+conditions.  `path_only_effect` classifies the change from master to path-only;
+`width_cost_effect` classifies the change from path-only to patched.  Together
+they show which half of the POC changed each decision.
 
 ## Experimental Sort width cost
+
+The default script also runs four focused regression probes: the 128-byte
+and 256-byte payloads at LIMIT 25%, and the 256kB work_mem query before and
+after refreshing width statistics.  `regression.sql` defines the runner and
+`regression_report.sql` prints the results; both are included automatically
+with psql's `\ir`.  Keep them next to `benchmark.sql` and run the latter as
+usual.  These probes do not add cases to the 110-case broad-matrix summary.
+
+Unlike the broad matrix, every policy executes every strategy in these
+probes.  Six batches rotate policy order; each call performs a warmup and
+three rotated timing samples per strategy.  Equivalence is checked in the
+first batch under each policy.  The stale-width probe runs before ANALYZE;
+the repaired probe uses the same table after ANALYZE.  The source width,
+query text, and effective work_mem are recorded at probe time.
+
+The report shows batch dispersion, actual natural-query time ratios against
+master, early/late winners, and surviving automatic-query candidate costs.
+Ratios above one mean slower.  The 3% band is a descriptive noise threshold,
+not a confidence interval or a statistical significance test.  Natural-query
+ratios can include other plan changes; inspect the recorded topology before
+attributing the difference solely to projection placement.  Before/after
+ANALYZE is also separated in time, so use within-phase policy comparisons.
+
+After timing, separate EXPLAIN ANALYZE executions record complete JSON plans
+with BUFFERS and TIMING OFF.  The compact report prints Sort costs, width,
+input/output rows, method, memory/disk space, and temporary I/O; verbose mode
+also prints full JSON.  These snapshots are diagnostic executions, not the
+timed samples.  Buffer counts include descendants and must not be summed
+across nodes.  A missing candidate means path pruning/classification did not
+expose it; it is not evidence of zero cost.  Temporary diagnostic tables are
+available until the psql session ends.
 
 The POC models two kinds of memory work in `cost_tuplesort()`:
 
@@ -220,6 +301,48 @@ charged by the existing costing code.  The divisors are calibration points,
 not proposed final constants.  `topnbench_measure()` and the pure Sort matrix
 exist specifically to test whether the two terms track measured executor work
 before tuning those values further.
+
+## Complete-result comparison experiment (0012)
+
+Rebuild and install the backend after applying this patch on top of 0011,
+then restart it before running `benchmark.sql`.  The extension C ABI is
+unchanged.  The normal script also runs `final_cost.sql` automatically.
+
+`enable_projection_total_cost` is a temporary, default-on switch.  With both
+existing POC switches on, turning this new switch off restores the 0011 final
+candidate comparison; it does **not** restore the upstream planner.
+
+The change applies only when the POC built alternative projection targets for
+a top-level SELECT with a constant-folded positive ordinary LIMIT, a known OFFSET, and
+an incoming tuple fraction of zero (expected complete consumption).  It
+compares final LimitPaths by total cost without using startup cost to break a
+total-cost tie.  LimitPath already accounts for OFFSET and LIMIT: no second
+fraction is applied.  Disabled nodes, pathkeys, parameterization, row count,
+parallel safety, and both existing fuzz factors retain their usual roles.
+Partial-result cursors, subqueries, WITH TIES, and unknown bounds retain the
+old comparison.  A cursor configured for full consumption can use the new
+comparison.  The width-cost formula and its coefficients are unchanged.
+
+`final_cost.sql` adds 12 targeted cases: widths 96/128/160/192/256 at 25%,
+128 bytes at 20%/30%, two OFFSET splits with the same 25,000 consumed rows,
+one high-work/low-LIMIT control, and two cases requesting two parallel workers.
+Each case alternates 0011/0012 order over four batches, with three timed runs
+per strategy per batch.  The first batch verifies result equality under each
+policy.  All three query forms use the same unique leading sort key.
+The OFFSET late control deliberately evaluates the skipped rows too.
+
+The summary reports paired natural-query time ratios (`new_vs_old`, lower is
+better), batches differing by more than 5%, early/late control timings, and
+the minimum workers actually launched by each policy.  A parallel case with
+zero launched workers is not evidence about parallel execution.  Four batches
+are a repeatability check, not a significance test.  Per-batch results remain
+in `topnbench_final_runs` for the session.
+
+Eight plan-equality guards cover partial-result cursors (1% and 10%), a
+bounded subquery, WITH TIES, LIMIT 0/ALL, a volatile expression, and an SRF.
+They abort if toggling the new switch changes an excluded case's plan.
+These checks do not establish that the cost model predicts every winner;
+in particular, the stale-width/spill regression remains a separate issue.
 
 ## Candidate path costs
 
@@ -270,6 +393,15 @@ An optional sixth argument runs all three statements with a specific
 ```sql
 SELECT * FROM topnbench_compare(auto_sql, late_sql, early_sql,
                                 5, true, '64kB');
+```
+
+The seventh argument requests plans only.  It ignores the iteration and
+verification work while retaining the same row type, with runtime fields set
+to NULL:
+
+```sql
+SELECT * FROM topnbench_compare(auto_sql, late_sql, early_sql,
+                                5, false, '64kB', true);
 ```
 
 The function rejects multiple statements, non-SELECT statements, `SELECT

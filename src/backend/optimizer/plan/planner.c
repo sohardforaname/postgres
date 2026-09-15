@@ -31,6 +31,7 @@
 #include "jit/jit.h"
 #include "lib/bipartite_match.h"
 #include "lib/knapsack.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -69,6 +70,8 @@ double		cursor_tuple_fraction = DEFAULT_CURSOR_TUPLE_FRACTION;
 int			debug_parallel_query = DEBUG_PARALLEL_OFF;
 bool		parallel_leader_participation = true;
 bool		enable_cost_based_delayed_projection = true;
+bool		enable_projection_total_cost = true;
+bool		debug_print_projection_paths = false;
 bool		enable_distinct_reordering = true;
 
 /* Hook for plugins to get control in planner() */
@@ -153,6 +156,9 @@ typedef struct
 } preprocess_subquery_phvs_context;
 
 /* Local functions */
+
+static void trace_projection_path(PlannerInfo *root, const char *stage,
+								  Path *path);
 static Node *preprocess_expression(PlannerInfo *root, Node *expr, int kind);
 static void preprocess_subquery_phvs(PlannerInfo *root);
 static bool preprocess_subquery_phvs_walker(Node *node,
@@ -548,6 +554,14 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	/* Select best Path and turn it into a Plan */
 	final_rel = fetch_upper_rel(root, UPPERREL_FINAL, NULL);
 	best_path = get_cheapest_fractional_path(final_rel, tuple_fraction);
+	if (debug_print_projection_paths && root->parse->sortClause &&
+		root->limit_tuples > 0)
+	{
+		ereport(DEBUG1,
+				(errmsg_internal("topn-path selection tuple_fraction=%.9g", tuple_fraction),
+				 errhidecontext(true)));
+		trace_projection_path(root, "selected", best_path);
+	}
 
 	top_plan = create_plan(root, best_path);
 
@@ -1768,10 +1782,12 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 				 SetOperationStmt *setops)
 {
 	Query	   *parse = root->parse;
+	double		caller_tuple_fraction = tuple_fraction;
 	int64		offset_est = 0;
 	int64		count_est = 0;
 	double		limit_tuples = -1.0;
 	bool		have_postponed_srfs = false;
+	bool		compare_final_total_cost;
 	PathTarget *final_target;
 	PathTarget *sort_early_target = NULL;
 	List	   *final_targets;
@@ -2204,6 +2220,25 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 	final_rel = fetch_upper_rel(root, UPPERREL_FINAL, NULL);
 
 	/*
+	 * POC: the caller of an ordinary top-level SELECT consumes the whole
+	 * Limit result.  Do not confuse that with the fraction of pre-Limit
+	 * tuples calculated by preprocess_limit().  For competing projection
+	 * paths, compare their already-adjusted final costs without letting a
+	 * startup advantage discard a lower-total-cost alternative.
+	 * Keep partial-result cursors, subqueries and LIMIT variants on the old
+	 * policy.  Require a folded positive constant: count_est alone cannot
+	 * distinguish LIMIT 0 from LIMIT 1, since preprocess_limit clamps it.
+	 */
+	compare_final_total_cost = enable_projection_total_cost &&
+		sort_early_target != NULL && root->query_level == 1 &&
+		caller_tuple_fraction == 0.0 && parse->commandType == CMD_SELECT &&
+		!parse->rowMarks && IsA(parse->limitCount, Const) &&
+		!((Const *) parse->limitCount)->constisnull &&
+		DatumGetInt64(((Const *) parse->limitCount)->constvalue) > 0 &&
+		offset_est >= 0 &&
+		parse->limitOption == LIMIT_OPTION_COUNT;
+
+	/*
 	 * If the input rel is marked consider_parallel and there's nothing that's
 	 * not parallel-safe in the LIMIT clause, then the final_rel can be marked
 	 * consider_parallel as well.  Note that if the query has rowMarks or is
@@ -2463,7 +2498,12 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 		}
 
 		/* And shove it into final_rel */
-		add_path(final_rel, path);
+		if (debug_print_projection_paths)
+			trace_projection_path(root, "final-proposed", path);
+		if (compare_final_total_cost)
+			add_path_with_total_cost(final_rel, path);
+		else
+			add_path(final_rel, path);
 	}
 
 	/*
@@ -2503,6 +2543,9 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 									current_rel, final_rel, &extra);
 
 	/* Note: currently, we leave it to callers to do set_cheapest() */
+	if (debug_print_projection_paths)
+		foreach(lc, final_rel->pathlist)
+			trace_projection_path(root, "final-surviving", lfirst(lc));
 }
 
 /*
@@ -5908,8 +5951,99 @@ create_ordered_paths(PlannerInfo *root,
 	 * need us to do it.
 	 */
 	Assert(ordered_rel->pathlist != NIL);
+	if (debug_print_projection_paths)
+		foreach(lc, ordered_rel->pathlist)
+			trace_projection_path(root, "ordered-surviving", lfirst(lc));
 
 	return ordered_rel;
+}
+
+/*
+ * Temporary POC diagnostics.  Observe real paths without recalculating their
+ * costs or changing the tournament.  ordered_id is local to one planner run:
+ * it identifies the surviving ORDERED path underneath a final Limit path.
+ * Zero means the bounded unary walk could not match that ancestry.
+ */
+static void
+trace_projection_path(PlannerInfo *root, const char *stage, Path *path)
+{
+	RelOptInfo *ordered_rel = NULL;
+	Path	   *node = path;
+	StringInfoData shape;
+	ListCell   *relcell;
+	int			ordered_id = 0;
+	int			sort_width = -1;
+
+	if (!debug_print_projection_paths || root->query_level != 1 ||
+		!root->parse->sortClause || root->limit_tuples <= 0)
+		return;
+
+	/* A redundant ORDER BY need not have built an ORDERED rel. */
+	foreach(relcell, root->upper_rels[UPPERREL_ORDERED])
+	{
+		RelOptInfo *rel = lfirst(relcell);
+
+		if (bms_is_empty(rel->relids))
+		{
+			ordered_rel = rel;
+			break;
+		}
+	}
+	initStringInfo(&shape);
+	for (int depth = 0; node != NULL && depth < 16; depth++)
+	{
+		Path	   *child = NULL;
+		const char *name = "Other";
+		ListCell   *lc;
+
+		foreach(lc, ordered_rel ? ordered_rel->pathlist : NIL)
+			if (lfirst(lc) == node && ordered_id == 0)
+				ordered_id = foreach_current_index(lc) + 1;
+
+		switch (nodeTag(node))
+		{
+			case T_LimitPath:
+				name = "Limit";
+				child = ((LimitPath *) node)->subpath;
+				break;
+			case T_ProjectionPath:
+				name = "Projection";
+				child = ((ProjectionPath *) node)->subpath;
+				break;
+			case T_SortPath:
+				name = "Sort";
+				child = ((SortPath *) node)->subpath;
+				break;
+			case T_IncrementalSortPath:
+				name = "IncrementalSort";
+				child = ((IncrementalSortPath *) node)->spath.subpath;
+				break;
+			case T_GatherPath:
+				name = "Gather";
+				child = ((GatherPath *) node)->subpath;
+				break;
+			case T_GatherMergePath:
+				name = "GatherMerge";
+				child = ((GatherMergePath *) node)->subpath;
+				break;
+			default:
+				break;
+		}
+		if (sort_width < 0 && child != NULL &&
+			(IsA(node, SortPath) || IsA(node, IncrementalSortPath)))
+			sort_width = child->pathtarget->width;
+		appendStringInfo(&shape, "%s%s", depth ? "/" : "", name);
+		node = child;
+	}
+	ereport(DEBUG1,
+			(errmsg_internal("topn-path stage=%s ordered_id=%d shape=%s rows=%.9g startup=%.12g total=%.12g disabled=%d parallel_safe=%d pathkeys=%d parameterized=%d consider_startup=%d sort_width=%d",
+							 stage, ordered_id, shape.data, path->rows,
+							 path->startup_cost, path->total_cost,
+							 path->disabled_nodes, path->parallel_safe,
+							 list_length(path->pathkeys), path->param_info != NULL,
+							 path->parent->consider_startup, sort_width),
+			 errhidecontext(true)));
+	pfree(shape.data);
 }
 
 
