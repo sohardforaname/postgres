@@ -122,6 +122,10 @@
  */
 #define APPEND_CPU_COST_MULTIPLIER 0.5
 
+/* Bound the prototype's per-call work and temporary arrays. */
+#define UNION_ALL_JOIN_MAX_CHILDREN 64
+#define UNION_ALL_JOIN_MAX_CLAUSES 16
+
 /*
  * Maximum value for row estimates.  We cap row estimates to this to help
  * ensure that costs based on these estimates remain within the range of what
@@ -5583,6 +5587,49 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
 	init_dummy_sjinfo(&sjinfo, path->outerjoinpath->parent->relids,
 					  path->innerjoinpath->parent->relids);
 
+	/*
+	 * For supported UNION ALL inner joins, estimate the pairs passing these
+	 * hash or merge clauses using child statistics, just as we do for the
+	 * joinrel estimate.  Use quals, not joinrestrictinfo or the joinrel's row
+	 * count: additional join filters may reject some of these pairs later.
+	 *
+	 * Child relation rows describe the whole unparameterized input.  Do not
+	 * reuse them for parameterized or partial paths, or paths whose row count
+	 * differs from their parent relation (for example, a UniquePath).
+	 * Outer and semi/anti joins retain the existing costing approximation.
+	 */
+	if (enable_union_all_join_estimates &&
+		path->jointype == JOIN_INNER &&
+		path->path.param_info == NULL &&
+		path->outerjoinpath->param_info == NULL &&
+		path->innerjoinpath->param_info == NULL &&
+		!path->path.parallel_aware && path->path.parallel_workers == 0 &&
+		!path->outerjoinpath->parallel_aware &&
+		path->outerjoinpath->parallel_workers == 0 &&
+		!path->innerjoinpath->parallel_aware &&
+		path->innerjoinpath->parallel_workers == 0 &&
+		outer_tuples == path->outerjoinpath->parent->rows &&
+		inner_tuples == path->innerjoinpath->parent->rows)
+	{
+		bool		all_restrictinfos = true;
+
+		/* approx_tuple_count also permits bare expressions as input. */
+		foreach(l, quals)
+		{
+			if (!IsA(lfirst(l), RestrictInfo))
+			{
+				all_restrictinfos = false;
+				break;
+			}
+		}
+		if (all_restrictinfos &&
+			estimate_union_all_join_rows(root,
+										 path->outerjoinpath->parent,
+										 path->innerjoinpath->parent,
+										 &sjinfo, quals, &tuples))
+			return tuples;
+	}
+
 	/* Get the approximate selectivity */
 	foreach(l, quals)
 	{
@@ -5760,16 +5807,21 @@ estimate_union_all_join_rows(PlannerInfo *root,
 {
 	RelOptInfo *appendrel = NULL;
 	RelOptInfo *otherrel;
-	List	   *childinfos = NIL;
-	List	   *parentvars = NIL;
+	AppendRelInfo *childinfos[UNION_ALL_JOIN_MAX_CHILDREN];
+	RelOptInfo *childrels[UNION_ALL_JOIN_MAX_CHILDREN];
+	AttrNumber parentattrs[UNION_ALL_JOIN_MAX_CLAUSES];
+	int			nchildren = 0;
+	int			nattrs = 0;
+	int			nclauses = list_length(restrictlist);
+	int			i;
 	ListCell   *lc;
 	double		nrows = 0;
 	bool		append_on_left;
 
 	if (sjinfo->jointype != JOIN_INNER || restrictlist == NIL ||
 		root->append_rel_list == NIL ||
-		list_length(root->append_rel_list) > 64 ||
-		list_length(restrictlist) > 16 ||
+		list_length(root->append_rel_list) > UNION_ALL_JOIN_MAX_CHILDREN ||
+		nclauses > UNION_ALL_JOIN_MAX_CLAUSES ||
 		get_relation_stats_hook != NULL ||
 		!bms_is_empty(outer_rel->lateral_relids) ||
 		!bms_is_empty(inner_rel->lateral_relids))
@@ -5824,7 +5876,12 @@ estimate_union_all_join_rows(PlannerInfo *root,
 		otherrte = root->simple_rte_array[othervar->varno];
 		if (otherrte->rtekind == RTE_SUBQUERY && otherrte->inh)
 			return false;
-		parentvars = lappend(parentvars, parentvar);
+		/* Validate each referenced parent column only once per child. */
+		for (i = 0; i < nattrs; i++)
+			if (parentattrs[i] == parentvar->varattno)
+				break;
+		if (i == nattrs)
+			parentattrs[nattrs++] = parentvar->varattno;
 	}
 
 	/* Validate all translations before asking any selectivity estimator. */
@@ -5833,7 +5890,6 @@ estimate_union_all_join_rows(PlannerInfo *root,
 		AppendRelInfo *appinfo = lfirst_node(AppendRelInfo, lc);
 		RelOptInfo *childrel;
 		RangeTblEntry *childrte;
-		ListCell   *lv;
 
 		if (appinfo->parent_relid != appendrel->relid)
 			continue;
@@ -5847,18 +5903,17 @@ estimate_union_all_join_rows(PlannerInfo *root,
 			(childrte->rtekind == RTE_SUBQUERY && childrte->inh))
 			return false;
 
-		foreach(lv, parentvars)
+		for (i = 0; i < nattrs; i++)
 		{
-			Var		   *parentvar = lfirst_node(Var, lv);
 			Node	   *translated;
 			Var		   *childvar;
 			VariableStatData vardata;
 			bool		has_stats;
 
-			if (parentvar->varattno > list_length(appinfo->translated_vars))
+			if (parentattrs[i] > list_length(appinfo->translated_vars))
 				return false;
 			translated = list_nth(appinfo->translated_vars,
-								  parentvar->varattno - 1);
+								  parentattrs[i] - 1);
 			childvar = union_all_join_var(translated);
 			if (childvar == NULL || childvar->varno != appinfo->child_relid)
 				return false;
@@ -5870,15 +5925,16 @@ estimate_union_all_join_rows(PlannerInfo *root,
 			if (!has_stats)
 				return false;
 		}
-		childinfos = lappend(childinfos, appinfo);
+		childinfos[nchildren] = appinfo;
+		childrels[nchildren++] = childrel;
 	}
-	if (childinfos == NIL)
+	if (nchildren == 0)
 		return false;
 
-	foreach(lc, childinfos)
+	for (i = 0; i < nchildren; i++)
 	{
-		AppendRelInfo *appinfo = lfirst_node(AppendRelInfo, lc);
-		RelOptInfo *childrel = find_base_rel(root, appinfo->child_relid);
+		AppendRelInfo *appinfo = childinfos[i];
+		RelOptInfo *childrel = childrels[i];
 		SpecialJoinInfo child_sjinfo;
 		List	   *childquals;
 		Selectivity selec;
@@ -5894,12 +5950,11 @@ estimate_union_all_join_rows(PlannerInfo *root,
 		selec = clauselist_selectivity(root, childquals, 0,
 									   JOIN_INNER, &child_sjinfo);
 		nrows += childrel->rows * otherrel->rows * selec;
+		list_free(childquals);
 	}
 
 	/* Do not round or clamp each child: small estimates must add up first. */
 	*rows = clamp_row_est(nrows);
-	list_free(parentvars);
-	list_free(childinfos);
 	return true;
 }
 
