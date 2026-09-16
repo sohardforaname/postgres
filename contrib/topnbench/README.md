@@ -1,5 +1,157 @@
 # topnbench
 
+## 0017: explain the executor's sort-memory boundary
+
+Apply on top of 0016. Rebuild/install PostgreSQL and restart the test server:
+this increment changes `tuplesort.c`, so installing the extension alone is
+not sufficient. No extension C/API change or new GUC is needed. The patch
+includes `sort_memory.sql`, and `benchmark.sql` runs it last. Capture both
+stdout and stderr, for example:
+
+```
+psql -X -v ON_ERROR_STOP=1 -f contrib/topnbench/benchmark.sql > topnbench-0017.log 2>&1
+```
+
+0016 found that the same 25%-LIMIT query changes winners as work_mem changes.
+At 16/24MB, early projection with an external sort beat late projection with
+a bounded heap. Also, an estimated K-row footprint that fits work_mem did not
+guarantee a bounded heap: tuplesort can exhaust array slots without LACKMEM()
+becoming true. Increasing estimated tuple bytes alone can change the selected
+path without fixing the CPU cost difference between these algorithms.
+Therefore 0017 gathers the missing transition evidence before changing costs.
+The planner, sorting decisions and 0015 cost formulas are unchanged.
+
+The existing `trace_sort` switch now emits `sort memory:` lines at:
+
+* `bounded-input`: immediately before converting the accumulated input to a heap;
+* `bounded-ready`: immediately after that conversion, with K retained tuples;
+* `external-input`: immediately before allocating tapes for the first spill;
+* `in-memory-input`: at end of input, before the serial in-memory sort.
+
+Each line gives the current tuple count, bound (-1 if unbounded), array capacity,
+`slots_full` and `memory_full`, allowed/used/available bytes, allocated array
+bytes, bytes occupied by live array entries, and separately accounted tuple
+bytes (also averaged over the current tuples). `memory_full` means LACKMEM(),
+i.e. negative available bytes, not merely zero bytes. Array bytes include its
+allocation overhead and unused capacity; live bytes are count * sizeof(SortTuple).
+For a by-value Datum input, separate tuple bytes should be zero. For a tuple
+input, this component includes the charge passed by tuplesort_puttupleslot(),
+including its allocator size class/overhead when using an AllocSet context.
+These are tuplesort's memory-accounting values, not process RSS, allocator
+context totals, or a high-water measurement over the whole execution.
+
+Read each `external-input` line to distinguish slot exhaustion from LACKMEM(),
+and check whether the count had reached K or 2*K. Compare `bounded-input` with
+`bounded-ready` to see how retaining a larger array affects memory after the
+heap has shrunk. This does not assume that replacing K with 2*K is a correct
+general planner model. Logs are emitted only when trace_sort is enabled;
+there are no new per-tuple counters or calls to inspect memory on the normal
+untraced path. Ordinary trace_sort output remains available too.
+
+The benchmark reuses the two fixed query triples and six work_mem points from
+0016. After ALL timed sections, it executes just the late and early forms once
+per cell: 24 diagnostic EXPLAIN ANALYZE executions, no additional timed matrix.
+Each is bracketed by `0017 BEGIN/END` markers; trace_sort is enabled only inside
+that interval. Full JSON plans are stored in the TEMP topnbench_memory_plans
+table. A 24-row report compares the original 0016 model with the observed method
+and memory/disk space; it does not use instrumented execution times as samples.
+Different observed methods are reported, not asserted away. Serial one-Sort
+shape checks still fail on unexpected plans. All diagnostic GUC changes use
+transaction-local settings and unwind on errors as well as normal completion.
+The entry point explicitly disables trace_sort before timing begins.
+
+The SQL phase needs the TEMP tables created by sort_boundary.sql, so it cannot
+run alone in a new session. If BEGIN/END markers appear without `sort memory:`
+lines, the running backend is probably still an older build; SQL alone cannot
+verify that this logging-only core change has been installed.
+
+## 0016: work_mem boundaries with fixed queries
+
+Apply on top of 0015 and run `benchmark.sql` as usual. This increment changes
+only SQL and documentation; no backend or extension rebuild is needed.
+The entry point includes the new `sort_boundary.sql` after `datum_cost.sql`.
+Keep all included SQL files alongside benchmark.sql. This script reuses TEMP
+catalogs from final_cost.sql and cannot run alone in a fresh psql session.
+
+Two existing query triples (`cost-1-work-16` and `limit-90pct`) are held fixed
+while work_mem varies over 4/8/16/24/32/256MB. These cells span the current
+model's retained-memory and full-input boundaries for one million rows.
+The script runs both 0014 and 0015 costing policies in four paired batches,
+reversing cell order and alternating policy order. Each existing compare call
+performs warmup and three rotated samples; first batches verify equivalent
+results. This adds 96 compare calls across 12 cells, not another broad matrix.
+Serial execution, JIT and tracing settings are controlled locally and restored.
+
+After ALL timing, 72 EXPLAIN ANALYZE diagnostics collect both policies and
+all three query forms. Full JSON plans are retained in TEMP tables. Guards
+require the intended int4 key, one serial Sort, a single-column late input,
+and a multi-column early input. An unexpected Sort algorithm does not fail:
+it is evidence to inspect. Summary and individual-batch reports show natural
+query ratios, actual early/late winners, wrong-choice counts, candidate costs,
+and the sort methods recorded during measurement warmups. A 5% band is a
+repeatability aid, not a statistical confidence interval.
+
+The diagnostic report independently replays the current cost model's method
+branch on each plan's estimates. It explicitly assumes the present x86_64
+layout: MAXALIGN=8, aligned heap header=24, SortTuple=24, and Datum plus length
+word=12. Other server banners have NULL predictions. These are model sizes, not
+measured allocation totals; capacity growth, tape buffers and the executor's
+online bounded-heap transition are not simulated. Both policies use their
+own size assumptions. Temp I/O and reported memory/disk space are observed
+separately. `quicksort` is the EXPLAIN method label and may include specialized
+integer/radix sorting; matching labels do not validate comparison CPU costs.
+
+Read mismatches first to identify missing memory/algorithm-boundary effects.
+For cells with matching methods but wrong early/late choices, investigate CPU
+and projection costs rather than fitting a global Datum discount. These are
+projection queries, not isolated Sort CPU benchmarks. Missing candidate costs
+still indicate that the hook did not observe both placements after pruning.
+No 0015 costs, coefficients, planner rules, GUCs or C interfaces are changed.
+
+
+## 0015: by-value Datum Sort sizes
+
+Apply on top of 0014. Rebuild/install PostgreSQL and restart the test server.
+`cost_sort()` has one additional boolean argument; in-tree callers, including
+postgres_fdw, are updated. Rebuild any external extension using that internal
+planner API. topnbench.c and the extension SQL function interface are unchanged.
+Run `benchmark.sql` as usual; it also includes `datum_cost.sql` automatically.
+
+This step recognizes bounded explicit SortPaths whose single by-value target
+expression matches their sole sort key. This includes int4 and other by-value
+types without assuming their comparison functions cost the same. Extra resjunk
+sort expressions, by-reference values, unbounded Sorts, IncrementalSort and
+sorts costed implicitly for joins/append retain the previous model.
+
+For eligible Sorts, input and retained memory use `sizeof(SortTuple)` per row,
+while temporary-file volume uses `sizeof(Datum) + sizeof(unsigned int)` per
+row. Initial run counts use memory bytes, not tape bytes. This omits allocation
+slack, tape buffers, NULL savings and random-access trailing length words;
+it is a forward-scan approximation, not an exact executor memory simulator.
+The separate MinimalTuple copying term is zero for by-value Datum input;
+the existing resident-memory term and comparison/extraction CPU costs remain.
+There is no fitted comparison discount, and no change to Result or expression
+costs. In-memory CPU gaps and top-N/quicksort differences remain open questions.
+
+The temporary `enable_sort_datum_cost` switch defaults to on and only acts
+when `enable_sort_tuple_width_cost` is also on. Turning only the new switch off
+restores 0014's costs without removing the existing width model. Existing
+master/path-only runs remain unaffected. The older 0011/0012 labels in
+`final_cost.sql` identify comparison rules, now with the current sort model;
+use the new 0014/0015 section for the direct comparison of this patch.
+
+`datum_cost.sql` adds ten plan guards: int4, int8, float8, nullable int4,
+OFFSET, two-column tuples, an extra sort expression, text, numeric and an
+unbounded sort. Excluded shapes must retain exactly the same plan, and the
+new switch must have no effect with width-cost disabled. Six existing queries
+(four lost-benefit cases and the 128/256-byte early controls) then run in four
+paired batches under both policies, with equivalence checks, warmups, and
+rotated timing samples. This adds 48 compare calls, not another broad matrix.
+The report shows both individual batches and paired median ratios; 5% bands
+are descriptive thresholds, not confidence intervals. Missing candidate costs
+still mean that a placement did not survive to the observing hook.
+
+
 ## 0014: Sort representation and projection controls
 
 Apply on top of 0013 and run `benchmark.sql` as usual. This is a SQL-only

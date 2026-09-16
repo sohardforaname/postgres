@@ -121,7 +121,7 @@
 #define APPEND_CPU_COST_MULTIPLIER 0.5
 
 /*
- * tuplesort copies every input tuple before it can compare or discard it, but
+ * Tuple-mode tuplesort copies each input before comparing or discarding it, but
  * only the bounded result remains resident in its heap.  Model these as two
  * separate kinds of memory work.  The constants are deliberately exposed as
  * named POC calibration points rather than a single fitted divisor.
@@ -159,6 +159,7 @@ bool		enable_bitmapscan = true;
 bool		enable_tidscan = true;
 bool		enable_sort = true;
 bool		enable_sort_tuple_width_cost = true;
+bool		enable_sort_datum_cost = true;
 bool		enable_incremental_sort = true;
 bool		enable_hashagg = true;
 bool		enable_groupagg = true;
@@ -1957,17 +1958,38 @@ cost_recursive_union(Path *runion, Path *nrterm, Path *rterm)
  * 'comparison_cost' is the extra cost per comparison, if any
  * 'sort_mem' is the number of kilobytes of work memory allowed for the sort
  * 'limit_tuples' is the bound on the number of output tuples; -1 if no bound
+ * 'datum_sort' identifies a proven single-column, pass-by-value Sort input
  */
 static void
 cost_tuplesort(Cost *startup_cost, Cost *run_cost,
 			   double tuples, int width,
 			   Cost comparison_cost, int sort_mem,
-			   double limit_tuples)
+			   double limit_tuples, bool datum_sort)
 {
 	double		input_bytes = relation_byte_size(tuples, width);
 	double		output_bytes;
 	double		output_tuples;
 	int64		sort_mem_bytes = sort_mem * (int64) 1024;
+	double		disk_bytes = input_bytes;
+
+	/* Keep both the upstream and 0014 comparison policies reproducible. */
+	datum_sort = datum_sort && enable_sort_tuple_width_cost &&
+		enable_sort_datum_cost;
+	if (datum_sort)
+	{
+		/*
+		 * tuplesort_putdatum() keeps a by-value datum inside SortTuple,
+		 * without allocating/copying a separate MinimalTuple.  Tape records
+		 * instead contain a length word and a Datum (only a length word for
+		 * NULL).  Use the non-NULL size, conservatively, and do not use tape
+		 * bytes to predict memory pressure or initial run count.
+		 *
+		 * Like the existing estimate, this omits array growth slack and tape
+		 * buffers.  It models a forward-only Sort, without trailing lengths.
+		 */
+		input_bytes = tuples * sizeof(SortTuple);
+		disk_bytes = tuples * (sizeof(Datum) + sizeof(unsigned int));
+	}
 
 	/*
 	 * We want to be sure the cost of a sort is never estimated as zero, even
@@ -1983,7 +2005,8 @@ cost_tuplesort(Cost *startup_cost, Cost *run_cost,
 	if (limit_tuples > 0 && limit_tuples < tuples)
 	{
 		output_tuples = limit_tuples;
-		output_bytes = relation_byte_size(output_tuples, width);
+		output_bytes = datum_sort ? output_tuples * sizeof(SortTuple) :
+			relation_byte_size(output_tuples, width);
 	}
 	else
 	{
@@ -1996,7 +2019,7 @@ cost_tuplesort(Cost *startup_cost, Cost *run_cost,
 		/*
 		 * We'll have to use a disk-based sort of all the tuples
 		 */
-		double		npages = ceil(input_bytes / BLCKSZ);
+		double		npages = ceil(disk_bytes / BLCKSZ);
 		double		nruns = input_bytes / sort_mem_bytes;
 		double		mergeorder = tuplesort_merge_order(sort_mem_bytes);
 		double		log_runs;
@@ -2049,11 +2072,12 @@ cost_tuplesort(Cost *startup_cost, Cost *run_cost,
 	 */
 	if (enable_sort_tuple_width_cost)
 	{
+		double		copy_bytes = datum_sort ? 0.0 : input_bytes;
 		double		resident_bytes = Min(output_bytes,
 									 (double) sort_mem_bytes);
 
 		*startup_cost += cpu_operator_cost *
-			(input_bytes / TUPLESORT_INPUT_BYTES_PER_COPY_COST +
+			(copy_bytes / TUPLESORT_INPUT_BYTES_PER_COPY_COST +
 			 resident_bytes / TUPLESORT_RESIDENT_BYTES_PER_COST);
 	}
 
@@ -2175,7 +2199,7 @@ cost_incremental_sort(Path *path,
 	 */
 	cost_tuplesort(&group_startup_cost, &group_run_cost,
 				   group_tuples, width, comparison_cost, sort_mem,
-				   limit_tuples);
+				   limit_tuples, false);
 
 	/*
 	 * Startup cost of incremental sort is the startup cost of its first group
@@ -2235,13 +2259,15 @@ cost_incremental_sort(Path *path,
  * but if it ever does, it should react gracefully to lack of key data.
  * (Actually, the thing we'd most likely be interested in is just the number
  * of sort keys, which all callers *could* supply.)
+ * Pass datum_sort only when the physical input is known to be a single
+ * by-value column; callers with unknown input representation pass false.
  */
 void
 cost_sort(Path *path, PlannerInfo *root,
 		  List *pathkeys, int input_disabled_nodes,
 		  Cost input_cost, double tuples, int width,
 		  Cost comparison_cost, int sort_mem,
-		  double limit_tuples)
+		  double limit_tuples, bool datum_sort)
 
 {
 	Cost		startup_cost;
@@ -2250,7 +2276,7 @@ cost_sort(Path *path, PlannerInfo *root,
 	cost_tuplesort(&startup_cost, &run_cost,
 				   tuples, width,
 				   comparison_cost, sort_mem,
-				   limit_tuples);
+				   limit_tuples, datum_sort);
 
 	startup_cost += input_cost;
 
@@ -2459,7 +2485,7 @@ cost_append(AppendPath *apath, PlannerInfo *root)
 								  subpath->pathtarget->width,
 								  0.0,
 								  work_mem,
-								  apath->limit_tuples);
+								  apath->limit_tuples, false);
 					}
 
 					subpath = &sort_path;
@@ -3903,7 +3929,7 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 					  outer_path->pathtarget->width,
 					  0.0,
 					  work_mem,
-					  -1.0);
+					  -1.0, false);
 		}
 
 		disabled_nodes += sort_path.disabled_nodes;
@@ -3946,7 +3972,7 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 				  inner_path->pathtarget->width,
 				  0.0,
 				  work_mem,
-				  -1.0);
+				  -1.0, false);
 		disabled_nodes += sort_path.disabled_nodes;
 		startup_cost += sort_path.startup_cost;
 		startup_cost += (sort_path.total_cost - sort_path.startup_cost)

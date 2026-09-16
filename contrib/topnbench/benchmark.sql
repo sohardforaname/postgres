@@ -21,6 +21,7 @@
 -- EXPLAINs in regression.sql, never the broad matrix or timed batches.
 SET debug_print_projection_paths = off;
 SET enable_projection_total_cost = on;
+SET trace_sort = off;
 
 DROP EXTENSION IF EXISTS topnbench;
 CREATE EXTENSION topnbench;
@@ -1290,3 +1291,10 @@ ORDER BY c.case_order;
 \ir final_cost.sql
 
 \ir sort_representation.sql
+
+\ir datum_cost.sql
+
+\ir sort_boundary.sql
+
+-- Keep execution tracing after every timed section.
+\ir sort_memory.sql

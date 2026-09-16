@@ -5468,7 +5468,7 @@ label_sort_with_costsize(PlannerInfo *root, Sort *plan, double limit_tuples)
 			  lefttree->plan_width,
 			  0.0,
 			  work_mem,
-			  limit_tuples);
+			  limit_tuples, false);
 	plan->plan.startup_cost = sort_path.startup_cost;
 	plan->plan.total_cost = sort_path.total_cost;
 	plan->plan.plan_rows = lefttree->plan_rows;

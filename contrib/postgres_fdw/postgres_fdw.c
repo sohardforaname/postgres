@@ -3989,7 +3989,7 @@ adjust_foreign_grouping_path_cost(PlannerInfo *root,
 				  width,
 				  0.0,
 				  work_mem,
-				  limit_tuples);
+				  limit_tuples, false);
 
 		*p_startup_cost = sort_path.startup_cost;
 		*p_run_cost = sort_path.total_cost - sort_path.startup_cost;

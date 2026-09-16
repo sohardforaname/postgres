@@ -462,6 +462,7 @@ static bool mergereadnext(Tuplesortstate *state, LogicalTape *srcTape, SortTuple
 static void dumptuples(Tuplesortstate *state, bool alltuples);
 static void make_bounded_heap(Tuplesortstate *state);
 static void sort_bounded_heap(Tuplesortstate *state);
+static void tuplesort_trace_memory(Tuplesortstate *state, const char *transition);
 static void tuplesort_sort_memtuples(Tuplesortstate *state);
 static void tuplesort_heap_insert(Tuplesortstate *state, SortTuple *tuple);
 static void tuplesort_heap_replace_top(Tuplesortstate *state, SortTuple *tuple);
@@ -1060,6 +1061,39 @@ noalloc:
 }
 
 /*
+ * Trace the memory accounted for at the initial sort-method decision, and
+ * just after building a bounded heap.  The allocated array can be larger than
+ * either the current tuple count or the bound.  Exhausting its slots does not
+ * imply LACKMEM(), which matters to the bounded-heap decision below.
+ *
+ * This is accounting used by tuplesort, not memory-context or process RSS.
+ * In particular, free allocator chunks and context blocks are not included.
+ * Only call this before tape buffers/slab allocation change the accounting.
+ */
+static void
+tuplesort_trace_memory(Tuplesortstate *state, const char *transition)
+{
+	int64		array_bytes = GetMemoryChunkSpace(state->memtuples);
+	int64		used_bytes = state->allowedMem - state->availMem;
+	int64		tuple_bytes = used_bytes - array_bytes;
+
+	Assert(state->status == TSS_INITIAL || state->status == TSS_BOUNDED);
+	Assert(!state->slabAllocatorUsed);
+
+	elog(LOG, "sort memory: transition=%s tuples=%d bound=%d capacity=%d "
+		 "slots_full=%d memory_full=%d allowed_bytes=" INT64_FORMAT
+		 " used_bytes=" INT64_FORMAT " available_bytes=" INT64_FORMAT
+		 " array_bytes=" INT64_FORMAT " array_live_bytes=" INT64_FORMAT
+		 " tuple_bytes=" INT64_FORMAT " tuple_avg_bytes=%.2f",
+		 transition, state->memtupcount, state->bounded ? state->bound : -1,
+		 state->memtupsize, state->memtupcount >= state->memtupsize,
+		 LACKMEM(state), state->allowedMem, used_bytes, state->availMem,
+		 array_bytes, (int64) state->memtupcount * (int64) sizeof(SortTuple),
+		 tuple_bytes, state->memtupcount > 0 ?
+		 (double) tuple_bytes / state->memtupcount : 0.0);
+}
+
+/*
  * Shared code for tuple and datum cases.
  */
 void
@@ -1140,10 +1174,15 @@ tuplesort_puttuple_common(Tuplesortstate *state, SortTuple *tuple,
 				 (state->memtupcount > state->bound && LACKMEM(state))))
 			{
 				if (trace_sort)
+				{
+					tuplesort_trace_memory(state, "bounded-input");
 					elog(LOG, "switching to bounded heapsort at %d tuples: %s",
 						 state->memtupcount,
 						 pg_rusage_show(&state->ru_start));
+				}
 				make_bounded_heap(state);
+				if (trace_sort)
+					tuplesort_trace_memory(state, "bounded-ready");
 				MemoryContextSwitchTo(oldcontext);
 				return;
 			}
@@ -1160,6 +1199,8 @@ tuplesort_puttuple_common(Tuplesortstate *state, SortTuple *tuple,
 			/*
 			 * Nope; time to switch to tape-based operation.
 			 */
+			if (trace_sort)
+				tuplesort_trace_memory(state, "external-input");
 			inittapes(state, true);
 
 			/*
@@ -1276,6 +1317,8 @@ tuplesort_performsort(Tuplesortstate *state)
 			if (SERIAL(state))
 			{
 				/* Sort in memory and we're done */
+				if (trace_sort)
+					tuplesort_trace_memory(state, "in-memory-input");
 				tuplesort_sort_memtuples(state);
 				state->status = TSS_SORTEDINMEM;
 			}

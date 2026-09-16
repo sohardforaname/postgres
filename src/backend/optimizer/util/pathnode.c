@@ -19,6 +19,7 @@
 #include "foreign/fdwapi.h"
 #include "miscadmin.h"
 #include "nodes/extensible.h"
+#include "nodes/nodeFuncs.h"
 #include "optimizer/appendinfo.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
@@ -28,6 +29,7 @@
 #include "optimizer/planmain.h"
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/selfuncs.h"
 
@@ -1663,7 +1665,7 @@ create_merge_append_path(PlannerInfo *root,
 						  subpath->pathtarget->width,
 						  0.0,
 						  work_mem,
-						  pathnode->limit_tuples);
+						  pathnode->limit_tuples, false);
 			}
 
 			subpath = &sort_path;
@@ -2954,6 +2956,7 @@ create_sort_path(PlannerInfo *root,
 				 double limit_tuples)
 {
 	SortPath   *pathnode = makeNode(SortPath);
+	bool		datum_sort = false;
 
 	pathnode->path.pathtype = T_Sort;
 	pathnode->path.parent = rel;
@@ -2968,13 +2971,31 @@ create_sort_path(PlannerInfo *root,
 
 	pathnode->subpath = subpath;
 
+	/*
+	 * ExecInitSort uses datum sorting only for a one-column input.  Prove
+	 * that prepare_sort_from_pathkeys will not add a resjunk sort expression.
+	 * Restrict this POC to bounded, explicit SortPaths; incremental sorts and
+	 * sorts costed implicitly for joins/append retain their existing model.
+	 */
+	if (limit_tuples > 0 && list_length(subpath->pathtarget->exprs) == 1 &&
+		list_length(pathkeys) == 1)
+	{
+		Expr	   *expr = linitial(subpath->pathtarget->exprs);
+		PathKey    *key = linitial_node(PathKey, pathkeys);
+
+		datum_sort = !key->pk_eclass->ec_has_volatile &&
+			get_typbyval(exprType((Node *) expr)) &&
+			find_ec_member_matching_expr(key->pk_eclass, expr,
+										 subpath->parent->relids) != NULL;
+	}
+
 	cost_sort(&pathnode->path, root, pathkeys,
 			  subpath->disabled_nodes,
 			  subpath->total_cost,
 			  subpath->rows,
 			  subpath->pathtarget->width,
 			  0.0,				/* XXX comparison_cost shouldn't be 0? */
-			  work_mem, limit_tuples);
+			  work_mem, limit_tuples, datum_sort);
 
 	return pathnode;
 }
@@ -3314,7 +3335,7 @@ create_groupingsets_path(PlannerInfo *root,
 						  subpath->pathtarget->width,
 						  0.0,
 						  work_mem,
-						  -1.0);
+						  -1.0, false);
 
 				/* Account for cost of aggregation */
 

@@ -56,6 +56,7 @@ extern PGDLLIMPORT bool enable_bitmapscan;
 extern PGDLLIMPORT bool enable_tidscan;
 extern PGDLLIMPORT bool enable_sort;
 extern PGDLLIMPORT bool enable_sort_tuple_width_cost;
+extern PGDLLIMPORT bool enable_sort_datum_cost;
 extern PGDLLIMPORT bool enable_incremental_sort;
 extern PGDLLIMPORT bool enable_hashagg;
 extern PGDLLIMPORT bool enable_groupagg;
@@ -113,7 +114,7 @@ extern void cost_sort(Path *path, PlannerInfo *root,
 					  List *pathkeys, int input_disabled_nodes,
 					  Cost input_cost, double tuples, int width,
 					  Cost comparison_cost, int sort_mem,
-					  double limit_tuples);
+					  double limit_tuples, bool datum_sort);
 extern void cost_incremental_sort(Path *path,
 								  PlannerInfo *root, List *pathkeys, int presorted_keys,
 								  int input_disabled_nodes,
