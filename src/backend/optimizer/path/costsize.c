@@ -96,6 +96,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/tidbitmap.h"
+#include "optimizer/appendinfo.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
@@ -105,6 +106,7 @@
 #include "optimizer/plancat.h"
 #include "optimizer/restrictinfo.h"
 #include "parser/parsetree.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
 #include "utils/spccache.h"
@@ -157,6 +159,7 @@ bool		enable_material = true;
 bool		enable_memoize = true;
 bool		enable_mergejoin = true;
 bool		enable_hashjoin = true;
+bool		enable_union_all_join_estimates = true;
 bool		enable_gathermerge = true;
 bool		enable_partitionwise_join = false;
 bool		enable_partitionwise_aggregate = false;
@@ -185,6 +188,12 @@ static void get_restriction_qual_cost(PlannerInfo *root, RelOptInfo *baserel,
 static bool has_indexed_join_quals(NestPath *path);
 static double approx_tuple_count(PlannerInfo *root, JoinPath *path,
 								 List *quals);
+static bool estimate_union_all_join_rows(PlannerInfo *root,
+										RelOptInfo *outer_rel,
+										RelOptInfo *inner_rel,
+										SpecialJoinInfo *sjinfo,
+										List *restrictlist, double *rows);
+static Var *union_all_join_var(Node *node);
 static double calc_joinrel_size_estimate(PlannerInfo *root,
 										 RelOptInfo *joinrel,
 										 RelOptInfo *outer_rel,
@@ -5689,6 +5698,11 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 						   SpecialJoinInfo *sjinfo,
 						   List *restrictlist)
 {
+	if (enable_union_all_join_estimates &&
+		estimate_union_all_join_rows(root, outer_rel, inner_rel,
+									 sjinfo, restrictlist, &rel->rows))
+		return;
+
 	rel->rows = calc_joinrel_size_estimate(root,
 										   rel,
 										   outer_rel,
@@ -5697,6 +5711,196 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 										   inner_rel->rows,
 										   sjinfo,
 										   restrictlist);
+}
+
+/*
+ * Return a plain column reference, possibly beneath binary relabels.  In
+ * particular, do not strip arbitrary casts, or accept null-extended Vars.
+ */
+static Var *
+union_all_join_var(Node *node)
+{
+	Var		   *var;
+
+	while (node && IsA(node, RelabelType))
+		node = (Node *) ((RelabelType *) node)->arg;
+	if (node == NULL || !IsA(node, Var))
+		return NULL;
+	var = (Var *) node;
+	if (var->varlevelsup != 0 || var->varattno <= 0 ||
+		!bms_is_empty(var->varnullingrels))
+		return NULL;
+	return var;
+}
+
+/*
+ * Estimate an inner equijoin with a flattened UNION ALL on one side.
+ *
+ * An appendrel made from UNION ALL has no column statistics of its own.
+ * However, an inner join distributes over UNION ALL, including duplicates,
+ * so we can estimate each child's join and add the estimates.  Multiply
+ * the selectivities of all clauses within each child before summing: the
+ * product of independently averaged selectivities would not be equivalent.
+ *
+ * This is deliberately limited to a direct UNION ALL input and simple
+ * column equalities with statistics available for every live child.  We do
+ * not recurse into another UNION ALL, change outer/semi/anti join estimates,
+ * or estimate parameterized paths this way.  The latter may have a different
+ * mixture of child rows, which cannot be inferred from the path's total rows.
+ *
+ * Keep the prototype's extra planning work bounded.  The entry limit applies
+ * to the entire append_rel_list, since we must scan it to find children.
+ */
+static bool
+estimate_union_all_join_rows(PlannerInfo *root,
+							 RelOptInfo *outer_rel,
+							 RelOptInfo *inner_rel,
+							 SpecialJoinInfo *sjinfo,
+							 List *restrictlist, double *rows)
+{
+	RelOptInfo *appendrel = NULL;
+	RelOptInfo *otherrel;
+	List	   *childinfos = NIL;
+	List	   *parentvars = NIL;
+	ListCell   *lc;
+	double		nrows = 0;
+	bool		append_on_left;
+
+	if (sjinfo->jointype != JOIN_INNER || restrictlist == NIL ||
+		root->append_rel_list == NIL ||
+		list_length(root->append_rel_list) > 64 ||
+		list_length(restrictlist) > 16 ||
+		get_relation_stats_hook != NULL ||
+		!bms_is_empty(outer_rel->lateral_relids) ||
+		!bms_is_empty(inner_rel->lateral_relids))
+		return false;
+
+	if (outer_rel->reloptkind == RELOPT_BASEREL &&
+		outer_rel->rtekind == RTE_SUBQUERY &&
+		root->simple_rte_array[outer_rel->relid]->inh)
+		appendrel = outer_rel;
+	if (inner_rel->reloptkind == RELOPT_BASEREL &&
+		inner_rel->rtekind == RTE_SUBQUERY &&
+		root->simple_rte_array[inner_rel->relid]->inh)
+	{
+		if (appendrel != NULL)
+			return false;
+		appendrel = inner_rel;
+	}
+	if (appendrel == NULL || IS_DUMMY_REL(appendrel))
+		return false;
+
+	append_on_left = (appendrel == outer_rel);
+	otherrel = append_on_left ? inner_rel : outer_rel;
+	if (IS_DUMMY_REL(otherrel))
+		return false;
+
+	/* Accept only equalities connecting the appendrel to the other input. */
+	foreach(lc, restrictlist)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		OpExpr	   *op;
+		Var		   *leftvar;
+		Var		   *rightvar;
+		Var		   *parentvar;
+		Var		   *othervar;
+		RangeTblEntry *otherrte;
+
+		if (!is_opclause(rinfo->clause))
+			return false;
+		op = (OpExpr *) rinfo->clause;
+		if (list_length(op->args) != 2 ||
+			get_oprjoin(op->opno) != F_EQJOINSEL || !op_strict(op->opno))
+			return false;
+		leftvar = union_all_join_var(linitial(op->args));
+		rightvar = union_all_join_var(lsecond(op->args));
+		if (leftvar == NULL || rightvar == NULL)
+			return false;
+		parentvar = leftvar->varno == appendrel->relid ? leftvar : rightvar;
+		othervar = parentvar == leftvar ? rightvar : leftvar;
+		if (parentvar->varno != appendrel->relid ||
+			!bms_is_member(othervar->varno, otherrel->relids))
+			return false;
+		otherrte = root->simple_rte_array[othervar->varno];
+		if (otherrte->rtekind == RTE_SUBQUERY && otherrte->inh)
+			return false;
+		parentvars = lappend(parentvars, parentvar);
+	}
+
+	/* Validate all translations before asking any selectivity estimator. */
+	foreach(lc, root->append_rel_list)
+	{
+		AppendRelInfo *appinfo = lfirst_node(AppendRelInfo, lc);
+		RelOptInfo *childrel;
+		RangeTblEntry *childrte;
+		ListCell   *lv;
+
+		if (appinfo->parent_relid != appendrel->relid)
+			continue;
+		childrel = find_base_rel(root, appinfo->child_relid);
+		if (IS_DUMMY_REL(childrel))
+			continue;
+		childrte = root->simple_rte_array[appinfo->child_relid];
+		if (!bms_is_empty(childrel->lateral_relids) ||
+			(childrte->rtekind != RTE_RELATION &&
+			 childrte->rtekind != RTE_SUBQUERY) ||
+			(childrte->rtekind == RTE_SUBQUERY && childrte->inh))
+			return false;
+
+		foreach(lv, parentvars)
+		{
+			Var		   *parentvar = lfirst_node(Var, lv);
+			Node	   *translated;
+			Var		   *childvar;
+			VariableStatData vardata;
+			bool		has_stats;
+
+			if (parentvar->varattno > list_length(appinfo->translated_vars))
+				return false;
+			translated = list_nth(appinfo->translated_vars,
+								  parentvar->varattno - 1);
+			childvar = union_all_join_var(translated);
+			if (childvar == NULL || childvar->varno != appinfo->child_relid)
+				return false;
+
+			/* Use the normal statistics lookup, including its security checks. */
+			examine_variable(root, translated, 0, &vardata);
+			has_stats = HeapTupleIsValid(vardata.statsTuple);
+			ReleaseVariableStats(vardata);
+			if (!has_stats)
+				return false;
+		}
+		childinfos = lappend(childinfos, appinfo);
+	}
+	if (childinfos == NIL)
+		return false;
+
+	foreach(lc, childinfos)
+	{
+		AppendRelInfo *appinfo = lfirst_node(AppendRelInfo, lc);
+		RelOptInfo *childrel = find_base_rel(root, appinfo->child_relid);
+		SpecialJoinInfo child_sjinfo;
+		List	   *childquals;
+		Selectivity selec;
+
+		/* This copies RestrictInfos and invalidates their cached estimates. */
+		childquals = (List *) adjust_appendrel_attrs(root,
+													   (Node *) restrictlist,
+													   1, &appinfo);
+		if (append_on_left)
+			init_dummy_sjinfo(&child_sjinfo, childrel->relids, otherrel->relids);
+		else
+			init_dummy_sjinfo(&child_sjinfo, otherrel->relids, childrel->relids);
+		selec = clauselist_selectivity(root, childquals, 0,
+									   JOIN_INNER, &child_sjinfo);
+		nrows += childrel->rows * otherrel->rows * selec;
+	}
+
+	/* Do not round or clamp each child: small estimates must add up first. */
+	*rows = clamp_row_est(nrows);
+	list_free(parentvars);
+	list_free(childinfos);
+	return true;
 }
 
 /*
