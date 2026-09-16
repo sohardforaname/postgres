@@ -1,5 +1,42 @@
 # topnbench
 
+## 0014: Sort representation and projection controls
+
+Apply on top of 0013 and run `benchmark.sql` as usual. This is a SQL-only
+increment: no backend or extension rebuild is needed. No costs, coefficients
+or planner rules change. The entry point also runs `sort_representation.sql`.
+If the previous benchmark's `topnbench_data` and extension are still installed,
+the new script can also be run directly with psql and ON_ERROR_STOP enabled.
+
+The new section reuses `topnbench_data`, testing LIMIT 250,000 and 900,000 at
+4MB and 256MB work_mem. Six query forms run in each cell: full one-/two-column
+scans, one-column Datum Sort, two-column tuple Sort, and the same one-column
+Sort followed by COST 100 function calls with zero or 16 work rounds. Every
+Sort has only one ordering key; the number of carried columns distinguishes
+the representations. COST 100 is a placement aid, not a calibrated work cost.
+
+Six batches rotate all six forms through every measurement position. Each
+call has one warmup and three timed samples, using existing topnbench_measure.
+This adds 144 measurement calls and 24 diagnostic executions. Core tracing is
+off throughout this section. Local settings are restored at its end.
+
+After timing, actual diagnostic plans must show one/two Sort input columns as
+specified and a Result above Sort for the projection controls. Unexpected
+shapes raise an error. The intended memory/disk regimes are NOT assumed: the
+report shows observed Sort methods, memory/disk usage and temporary I/O, and
+also lists the method captured in each measurement call's warmup. If a regime
+differs, interpret that cell according to the observed method before fitting
+any coefficient. Full plans and per-batch results remain in session tables.
+
+`tuple_vs_datum` compares paired total execution times. `*_minus_scan_ms`
+subtract matched full-scan times as a proxy for incremental sorting work,
+not exclusive Sort-node time. Projection deltas include Result dispatch,
+function calls, expression work and an extra output column; they cannot by
+themselves identify cpu_tuple_cost. Negative deltas remain visible as noise.
+Use the per-batch table to judge repeatability rather than fitting constants
+from one aggregate ratio. These results complement the existing width and
+early-winner controls; they do not resolve stale statistics automatically.
+
 ## 0013: cleanup and benefit-loss diagnostics
 
 Apply 0013 on top of the functional 0012. Rebuild/install both PostgreSQL and

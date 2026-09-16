@@ -1288,3 +1288,5 @@ ORDER BY c.case_order;
 
 -- Compare the 0011 policy with complete-result candidate pruning directly.
 \ir final_cost.sql
+
+\ir sort_representation.sql
