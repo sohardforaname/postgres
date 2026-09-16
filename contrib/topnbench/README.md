@@ -1,5 +1,91 @@
 # topnbench
 
+## 0019: separate radix dispatch from sort-memory boundaries
+
+Apply after 0018, rebuild/install PostgreSQL and restart the test server.
+This changes tuplesort.c, guc_parameters.dat and guc.h; the extension C/API
+is unchanged. `benchmark.sql` includes the new `sort_algorithm.sql`.
+
+The temporary, default-off developer GUC `debug_disable_sort_radix` skips
+radix dispatch and uses the existing qsort fallback. It does not change
+planner costs, comparator selection, or bounded-heap sorting. This is an
+experiment switch, not a recommendation to disable radix sorting. The main
+benchmark explicitly starts with the switch off.
+
+Six existing cells are reused: cost-1-work-16 at 4/16/24/32/256MB and
+limit-90pct at 256MB. These include external-run sorting, in-memory full
+sorting and heap negative controls on the reported PG20 build. Each cell
+runs four paired batches, alternating mode and cell order, with three timed
+runs per query form and first-batch result checks in both modes: 48 compare
+calls in total. The planner policy stays at the full current POC throughout.
+
+Before timing, 36 plain JSON plans must match exactly across modes, including
+estimated costs. After all timed batches, 36 traced actual plans must retain
+the same Sort method category and input row count. Projection shapes and
+serial execution are checked. All settings inside the experiment are local
+and restore on success or error. The script requires the TEMP fixtures from
+final_cost.sql and sort_boundary.sql; run benchmark.sql in one psql session.
+
+The summary reports paired disabled/default ratios for auto, late and early;
+values above one mean disabling radix was slower. It also reports winners
+in each mode. Four batches are a repeatability check, not a significance
+test. Per-batch data and both sets of plans remain in TEMP tables.
+
+With trace_sort on, `sort dispatch:` records radix-entry, qsort-single or
+qsort-tuple at the existing dispatch point. An external sort can produce
+several messages, one per run. radix-entry means entry into radix_sort_tuple;
+that routine can return for presorted data or use qsort internally. EXPLAIN
+can still say quicksort when radix dispatch was used. A bounded heap does
+not use this dispatch. Diagnostic timings are excluded from the comparison.
+
+Use the 16/24MB external-early versus heap-late cells to see whether algorithm
+choice explains part of the early win. Check the 32/256MB heap cells for
+noise, and the 90%/256MB full-sort cell for representation-dependent effects.
+No CPU coefficients or planner memory formulas are changed by this patch.
+
+
+## 0018: release the root discarded during heap construction
+
+Apply after 0017, rebuild/install PostgreSQL and restart the test server.
+No extension rebuild is needed. `benchmark.sql` includes the new
+`heap_release.sql`; keep capturing stdout and stderr in the same log.
+
+The replacement branch in make_bounded_heap() previously overwrote the old
+root without releasing its separately allocated tuple. The replacement
+helper only rearranges SortTuple entries. Free the old root first, as the
+normal TSS_BOUNDED input path already does. By-value Datum sorts have no
+separate tuple to free. Sorting results, costing and method selection are
+not intentionally changed; discarded allocations no longer remain until
+the sort context is reset. Memory reporting and runtime can change.
+
+The new focused check uses 8193 fixed-width rows and LIMIT 4096, in ascending,
+descending and permuted input order. Heap construction occurs on the final
+input row. Ascending order discards every additional input; descending order
+replaces every old root; the permutation exercises both branches. Both a
+one-column Datum Sort and a two-column tuple Sort are checked. It verifies
+all returned keys in order and each tuple payload, requires an actual serial
+top-N heap over a Seq Scan, then compares memory with the ascending control.
+The reported extra_vs_ascending_kb must be zero for all six cases. This
+comparison avoids assuming the allocator's chunk size or server word size.
+
+Six traced EXPLAIN ANALYZE executions occur after the existing timing phases.
+BEGIN/END markers and 0017's bounded-input/bounded-ready logs expose the
+release; diagnostic execution times are not benchmark samples. For the
+earlier million-row random case, inspect whether bounded-ready tuple_bytes
+falls from 16931360 to 10000000 on the same build/layout. Existing boundary
+tests remain in place to measure any runtime effects independently.
+
+Unlike the earlier diagnostic scripts, heap_release.sql is self-contained
+and also runs on an unpatched server to reproduce the failure:
+
+```
+psql -X -v ON_ERROR_STOP=1 -f contrib/topnbench/heap_release.sql > heap-release.log 2>&1
+```
+
+The test uses its own TEMP tables and no extension functions or POC GUCs.
+Settings are local to each DO transaction and restore on success or error.
+Run on a test instance; the rest of benchmark.sql still rebuilds its fixtures.
+
 ## 0017: explain the executor's sort-memory boundary
 
 Apply on top of 0016. Rebuild/install PostgreSQL and restart the test server:

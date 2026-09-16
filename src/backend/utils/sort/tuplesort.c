@@ -121,6 +121,7 @@
 
 /* GUC variables */
 bool		trace_sort = false;
+bool		debug_disable_sort_radix = false;
 
 #ifdef DEBUG_BOUNDED_SORT
 bool		optimize_bounded_sort = true;
@@ -2561,7 +2562,11 @@ make_bounded_heap(Tuplesortstate *state)
 				CHECK_FOR_INTERRUPTS();
 			}
 			else
+			{
+				/* The heap replacement routine does not free the old root. */
+				free_sort_tuple(state, &state->memtuples[0]);
 				tuplesort_heap_replace_top(state, &state->memtuples[i]);
+			}
 		}
 	}
 
@@ -3052,12 +3057,16 @@ tuplesort_sort_memtuples(Tuplesortstate *state)
 			SortSupport ssup = &state->base.sortKeys[0];
 
 			/* Does it compare as an integer? */
-			if (state->memtupcount >= QSORT_THRESHOLD &&
+			if (!debug_disable_sort_radix &&
+				state->memtupcount >= QSORT_THRESHOLD &&
 				(ssup->comparator == ssup_datum_uint64_cmp ||
 				 ssup->comparator == ssup_datum_int64_cmp ||
 				 ssup->comparator == ssup_datum_uint32_cmp ||
 				 ssup->comparator == ssup_datum_int32_cmp))
 			{
+				if (trace_sort)
+					elog(LOG, "sort dispatch: radix-entry, tuples=%d",
+						 state->memtupcount);
 				radix_sort_tuple(state->memtuples,
 								 state->memtupcount,
 								 state);
@@ -3069,11 +3078,17 @@ tuplesort_sort_memtuples(Tuplesortstate *state)
 		/* Can we use the single-key sort function? */
 		if (state->base.onlyKey != NULL)
 		{
+			if (trace_sort)
+				elog(LOG, "sort dispatch: qsort-single, tuples=%d",
+					 state->memtupcount);
 			qsort_ssup(state->memtuples, state->memtupcount,
 					   state->base.onlyKey);
 		}
 		else
 		{
+			if (trace_sort)
+				elog(LOG, "sort dispatch: qsort-tuple, tuples=%d",
+					 state->memtupcount);
 			qsort_tuple(state->memtuples,
 						state->memtupcount,
 						state->base.comparetup,

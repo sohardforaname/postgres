@@ -22,6 +22,7 @@
 SET debug_print_projection_paths = off;
 SET enable_projection_total_cost = on;
 SET trace_sort = off;
+SET debug_disable_sort_radix = off;
 
 DROP EXTENSION IF EXISTS topnbench;
 CREATE EXTENSION topnbench;
@@ -1296,5 +1297,9 @@ ORDER BY c.case_order;
 
 \ir sort_boundary.sql
 
+\ir sort_algorithm.sql
+
 -- Keep execution tracing after every timed section.
 \ir sort_memory.sql
+
+\ir heap_release.sql
