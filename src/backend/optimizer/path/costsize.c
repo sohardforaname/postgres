@@ -88,6 +88,7 @@
 #include "access/amapi.h"
 #include "access/htup_details.h"
 #include "access/tsmapi.h"
+#include "catalog/pg_statistic.h"
 #include "executor/executor.h"
 #include "executor/nodeAgg.h"
 #include "executor/nodeHash.h"
@@ -198,6 +199,7 @@ static bool estimate_union_all_join_rows(PlannerInfo *root,
 										SpecialJoinInfo *sjinfo,
 										List *restrictlist, double *rows);
 static Var *union_all_join_var(Node *node);
+static bool union_all_join_has_mcv(PlannerInfo *root, Node *node, Oid opfunc);
 static double calc_joinrel_size_estimate(PlannerInfo *root,
 										 RelOptInfo *joinrel,
 										 RelOptInfo *outer_rel,
@@ -5781,6 +5783,37 @@ union_all_join_var(Node *node)
 }
 
 /*
+ * Require the value-aware branch of eqjoinsel_inner() to be available on
+ * both sides.  Merely finding a statistics tuple is insufficient: without
+ * both MCV lists eqjoinsel uses an NDV-only estimate.  Summing those estimates
+ * can greatly overestimate rare or disjoint keys in low-NDV children.
+ *
+ * Check access with the actual equality function, as eqjoinsel does.  Only
+ * inspect slot presence here; the estimator remains responsible for reading
+ * values and combining MCV and non-MCV contributions.  This guard neither
+ * requires complete MCV coverage nor guarantees accuracy after filtering.
+ */
+static bool
+union_all_join_has_mcv(PlannerInfo *root, Node *node, Oid opfunc)
+{
+	VariableStatData vardata;
+	AttStatsSlot sslot;
+	bool		has_mcv = false;
+
+	examine_variable(root, node, 0, &vardata);
+	if (HeapTupleIsValid(vardata.statsTuple) &&
+		statistic_proc_security_check(&vardata, opfunc) &&
+		get_attstatsslot(&sslot, vardata.statsTuple,
+						STATISTIC_KIND_MCV, InvalidOid, 0))
+	{
+		has_mcv = true;
+		free_attstatsslot(&sslot);
+	}
+	ReleaseVariableStats(vardata);
+	return has_mcv;
+}
+
+/*
  * Estimate an inner equijoin with a flattened UNION ALL on one side.
  *
  * An appendrel made from UNION ALL has no column statistics of its own.
@@ -5790,7 +5823,8 @@ union_all_join_var(Node *node)
  * product of independently averaged selectivities would not be equivalent.
  *
  * This is deliberately limited to a direct UNION ALL input and simple
- * column equalities with statistics available for every live child.  We do
+ * column equalities with usable MCV lists on both sides for every live
+ * child.  Missing MCVs cause whole-call fallback, not mixed estimates.  We do
  * not recurse into another UNION ALL, change outer/semi/anti join estimates,
  * or estimate parameterized paths this way.  The latter may have a different
  * mixture of child rows, which cannot be inferred from the path's total rows.
@@ -5810,6 +5844,7 @@ estimate_union_all_join_rows(PlannerInfo *root,
 	AppendRelInfo *childinfos[UNION_ALL_JOIN_MAX_CHILDREN];
 	RelOptInfo *childrels[UNION_ALL_JOIN_MAX_CHILDREN];
 	AttrNumber parentattrs[UNION_ALL_JOIN_MAX_CLAUSES];
+	Oid			opfuncs[UNION_ALL_JOIN_MAX_CLAUSES];
 	int			nchildren = 0;
 	int			nattrs = 0;
 	int			nclauses = list_length(restrictlist);
@@ -5856,6 +5891,8 @@ estimate_union_all_join_rows(PlannerInfo *root,
 		Var		   *rightvar;
 		Var		   *parentvar;
 		Var		   *othervar;
+		Node	   *otherexpr;
+		Oid			opfunc;
 		RangeTblEntry *otherrte;
 
 		if (!is_opclause(rinfo->clause))
@@ -5876,12 +5913,21 @@ estimate_union_all_join_rows(PlannerInfo *root,
 		otherrte = root->simple_rte_array[othervar->varno];
 		if (otherrte->rtekind == RTE_SUBQUERY && otherrte->inh)
 			return false;
-		/* Validate each referenced parent column only once per child. */
+		opfunc = get_opcode(op->opno);
+		otherexpr = parentvar == leftvar ? lsecond(op->args) : linitial(op->args);
+		if (!OidIsValid(opfunc) ||
+			!union_all_join_has_mcv(root, otherexpr, opfunc))
+			return false;
+
+		/* Different equality functions can have different access checks. */
 		for (i = 0; i < nattrs; i++)
-			if (parentattrs[i] == parentvar->varattno)
+			if (parentattrs[i] == parentvar->varattno && opfuncs[i] == opfunc)
 				break;
 		if (i == nattrs)
-			parentattrs[nattrs++] = parentvar->varattno;
+		{
+			parentattrs[nattrs] = parentvar->varattno;
+			opfuncs[nattrs++] = opfunc;
+		}
 	}
 
 	/* Validate all translations before asking any selectivity estimator. */
@@ -5907,8 +5953,6 @@ estimate_union_all_join_rows(PlannerInfo *root,
 		{
 			Node	   *translated;
 			Var		   *childvar;
-			VariableStatData vardata;
-			bool		has_stats;
 
 			if (parentattrs[i] > list_length(appinfo->translated_vars))
 				return false;
@@ -5918,11 +5962,7 @@ estimate_union_all_join_rows(PlannerInfo *root,
 			if (childvar == NULL || childvar->varno != appinfo->child_relid)
 				return false;
 
-			/* Use the normal statistics lookup, including its security checks. */
-			examine_variable(root, translated, 0, &vardata);
-			has_stats = HeapTupleIsValid(vardata.statsTuple);
-			ReleaseVariableStats(vardata);
-			if (!has_stats)
+			if (!union_all_join_has_mcv(root, translated, opfuncs[i]))
 				return false;
 		}
 		childinfos[nchildren] = appinfo;
