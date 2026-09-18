@@ -89,8 +89,12 @@ BEGIN
 
     -- Trace only after ALL new timed batches finish.  An external sort may
     -- emit one dispatch per run; radix-entry is not a recursion counter.
-    PERFORM set_config('client_min_messages', 'log', true);
-    PERFORM set_config('trace_sort', 'on', true);
+    PERFORM set_config('client_min_messages',
+                CASE WHEN current_setting('topnbench.trace', true) = 'on'
+                     THEN 'log' ELSE 'warning' END, true);
+    PERFORM set_config('trace_sort',
+                CASE WHEN current_setting('topnbench.trace', true) = 'on'
+                     THEN 'on' ELSE 'off' END, true);
     FOR c IN SELECT * FROM topnbench_algorithm_cases ORDER BY case_no, mem_no LOOP
         PERFORM set_config('work_mem', c.work_mem_setting, true);
         FOREACH m IN ARRAY ARRAY['default', 'radix-disabled'] LOOP
@@ -204,6 +208,7 @@ SELECT c.case_name, c.work_mem_setting,
 FROM pairs p JOIN topnbench_algorithm_cases c USING (case_no, mem_no)
 GROUP BY c.case_no, c.mem_no, c.case_name, c.work_mem_setting ORDER BY c.case_no, c.mem_no;
 
+\if :topnbench_verbose
 \echo '== 0019 actual method categories; radix dispatch is in the BEGIN/END trace =='
 SELECT c.case_name, c.work_mem_setting, n.mode, n.strategy,
        n.node->>'Sort Method' AS method, n.node->>'Sort Space Type' AS space_type,
@@ -220,3 +225,5 @@ SELECT c.case_name, c.work_mem_setting, r.batch, r.mode, r.planner_choice,
        round(r.forced_early_median_ms::numeric, 3) AS early_ms, r.actual_winner
 FROM topnbench_algorithm_runs r JOIN topnbench_algorithm_cases c USING (case_no, mem_no)
 ORDER BY c.case_no, c.mem_no, r.batch, r.mode;
+
+\endif

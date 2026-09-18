@@ -98,12 +98,21 @@ typedef enum
 	DEBUG_PARALLEL_REGRESS,
 }			DebugParallelMode;
 
+/* Temporary projection-placement experiment, restricted in planner.c. */
+typedef enum
+{
+	DEBUG_PROJECTION_AUTO,
+	DEBUG_PROJECTION_EARLY,
+	DEBUG_PROJECTION_LATE,
+}			DebugProjectionPlacement;
+
 /* GUC parameters */
 extern PGDLLIMPORT int debug_parallel_query;
 extern PGDLLIMPORT bool parallel_leader_participation;
 extern PGDLLIMPORT bool enable_cost_based_delayed_projection;
 extern PGDLLIMPORT bool enable_projection_total_cost;
 extern PGDLLIMPORT bool debug_print_projection_paths;
+extern PGDLLIMPORT int debug_projection_placement;
 extern PGDLLIMPORT bool enable_distinct_reordering;
 
 extern PlannedStmt *planner(Query *parse, const char *query_string,

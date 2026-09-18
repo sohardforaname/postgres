@@ -72,6 +72,7 @@ bool		parallel_leader_participation = true;
 bool		enable_cost_based_delayed_projection = true;
 bool		enable_projection_total_cost = true;
 bool		debug_print_projection_paths = false;
+int			debug_projection_placement = DEBUG_PROJECTION_AUTO;
 bool		enable_distinct_reordering = true;
 
 /* Hook for plugins to get control in planner() */
@@ -5719,6 +5720,7 @@ create_ordered_paths(PlannerInfo *root,
 		Path	   *sorted_path;
 		Path	   *early_sorted_path = NULL;
 		bool		is_sorted;
+		bool		test_placement;
 		int			presorted_keys;
 
 		is_sorted = pathkeys_count_contained_in(root->sort_pathkeys,
@@ -5760,6 +5762,16 @@ create_ordered_paths(PlannerInfo *root,
 		}
 
 		/*
+		 * Temporary experiment: filter only alternatives the POC already
+		 * considers legal, before add_path() can prune either placement.
+		 * Do not rewrite targets or sort keys.  Unsupported paths keep their
+		 * normal treatment; the benchmark must verify the resulting shape.
+		 */
+		test_placement = early_target != NULL && root->query_level == 1 &&
+			!root->glob->parallelModeOK && !root->parse->hasTargetSRFs &&
+			IsA(sorted_path, SortPath);
+
+		/*
 		 * If cost-based projection placement is applicable, build the
 		 * competing path that evaluates the complete target before Sort.  Use
 		 * create_projection_path() so that the late input path is not
@@ -5778,7 +5790,9 @@ create_ordered_paths(PlannerInfo *root,
 												  early_input_path, early_input_path,
 												  root->sort_pathkeys, limit_tuples);
 
-			add_path(ordered_rel, early_sorted_path);
+			if (!test_placement ||
+				debug_projection_placement != DEBUG_PROJECTION_LATE)
+				add_path(ordered_rel, early_sorted_path);
 		}
 
 		/*
@@ -5796,7 +5810,9 @@ create_ordered_paths(PlannerInfo *root,
 													   sorted_path, target);
 		}
 
-		add_path(ordered_rel, sorted_path);
+		if (!test_placement ||
+			debug_projection_placement != DEBUG_PROJECTION_EARLY)
+			add_path(ordered_rel, sorted_path);
 	}
 
 	/*

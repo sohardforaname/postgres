@@ -28,7 +28,9 @@ BEGIN
     PERFORM set_config('synchronize_seqscans', 'off', true);
     PERFORM set_config('jit', 'off', true);
     PERFORM set_config('trace_sort', 'off', true);
-    PERFORM set_config('client_min_messages', 'log', true);
+    PERFORM set_config('client_min_messages',
+                CASE WHEN current_setting('topnbench.trace', true) = 'on'
+                     THEN 'log' ELSE 'warning' END, true);
     SELECT array_agg(g ORDER BY g) INTO expected_keys FROM generate_series(0, 4095) g;
 
     FOREACH ord IN ARRAY ARRAY['ascending', 'descending', 'random'] LOOP
@@ -58,7 +60,9 @@ BEGIN
             END IF;
 
             RAISE NOTICE '0018 BEGIN order=% variant=% N=8193 K=4096', ord, variant;
-            PERFORM set_config('trace_sort', 'on', true);
+            PERFORM set_config('trace_sort',
+                CASE WHEN current_setting('topnbench.trace', true) = 'on'
+                     THEN 'on' ELSE 'off' END, true);
             EXECUTE 'EXPLAIN (ANALYZE, VERBOSE, BUFFERS, COSTS OFF, '
                     'TIMING OFF, SUMMARY ON, FORMAT JSON) ' || query INTO saved_plan;
             PERFORM set_config('trace_sort', 'off', true);

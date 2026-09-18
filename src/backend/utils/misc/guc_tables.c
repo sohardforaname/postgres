@@ -404,6 +404,13 @@ static const struct config_enum_entry recovery_prefetch_options[] = {
 	{NULL, 0, false}
 };
 
+static const struct config_enum_entry debug_projection_placement_options[] = {
+	{"auto", DEBUG_PROJECTION_AUTO, false},
+	{"early", DEBUG_PROJECTION_EARLY, false},
+	{"late", DEBUG_PROJECTION_LATE, false},
+	{NULL, 0, false}
+};
+
 static const struct config_enum_entry debug_parallel_query_options[] = {
 	{"off", DEBUG_PARALLEL_OFF, false},
 	{"on", DEBUG_PARALLEL_ON, false},

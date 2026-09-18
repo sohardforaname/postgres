@@ -207,6 +207,7 @@ SELECT c.case_name, c.work_mem_setting,
 FROM pairs p JOIN topnbench_boundary_cases c USING (case_no, mem_no)
 GROUP BY c.case_no, c.mem_no, c.case_name, c.work_mem_setting ORDER BY c.case_no, c.mem_no;
 
+\if :topnbench_verbose
 \echo '== 0016 predicted versus observed Sort branch (diagnostic executions) =='
 SELECT case_name, work_mem_setting, policy, strategy, input_columns,
        node->>'Plan Rows' AS estimated_rows, node#>>'{Plans,0,Actual Rows}' AS actual_input_rows,
@@ -236,3 +237,5 @@ WHERE o.policy = '0014' AND n.policy = '0015' ORDER BY c.case_no, c.mem_no, o.ba
 -- Preserve exact reproduction SQL without repeating it for every memory cell.
 SELECT DISTINCT case_name, limit_rows, auto_query, manual_late_query, forced_early_query
 FROM topnbench_boundary_cases ORDER BY case_name;
+
+\endif

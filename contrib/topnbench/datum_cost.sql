@@ -130,6 +130,7 @@ SELECT case_name, string_agg(DISTINCT old_choice, '/') AS choice_0014,
        round(percentile_cont(0.5) WITHIN GROUP (ORDER BY early_ms)::numeric, 3) AS early_ms
 FROM pairs GROUP BY case_no, case_name ORDER BY case_no;
 
+\if :topnbench_verbose
 \echo '== 0015 paired batches and surviving candidate estimates =='
 SELECT o.case_name, o.batch, o.planner_choice AS choice_0014,
        n.planner_choice AS choice_0015,
@@ -142,3 +143,5 @@ SELECT o.case_name, o.batch, o.planner_choice AS choice_0014,
        round(n.late_limit_cost::numeric, 3) AS late_cost_0015
 FROM topnbench_datum_runs o JOIN topnbench_datum_runs n USING (case_no, case_name, batch)
 WHERE o.policy = '0014' AND n.policy = '0015' ORDER BY o.case_no, o.batch;
+
+\endif

@@ -64,6 +64,7 @@ SELECT case_name, count(*) AS batches,
        round(max(patched_vs_master)::numeric, 4) AS max_ratio
 FROM topnbench_regression_pairs GROUP BY case_name ORDER BY case_name;
 
+\if :topnbench_verbose
 \echo '== Surviving automatic-query candidate costs (one row per distinct decision) =='
 \echo 'Final selection is traced earlier between topn-trace BEGIN/END markers (capture stderr too).'
 -- Rewritten-query root costs are intentionally not used as candidate costs.
@@ -119,6 +120,8 @@ SELECT case_name, late_sql, early_sql FROM topnbench_regression_inputs
 ORDER BY case_name;
 SELECT case_name, policy, strategy, jsonb_pretty(plan) AS full_plan
 FROM topnbench_regression_plans ORDER BY case_name, policy, strategy;
+\endif
+
 \endif
 
 \echo '== Regression diagnostics complete =='

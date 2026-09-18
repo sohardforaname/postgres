@@ -150,8 +150,12 @@ BEGIN
             PERFORM set_config('enable_projection_total_cost',
                                CASE p WHEN '0012' THEN 'on' ELSE 'off' END, true);
             RAISE NOTICE 'topn-trace BEGIN case=% policy=%', c.case_name, p;
-            PERFORM set_config('client_min_messages', 'debug1', true);
-            PERFORM set_config('debug_print_projection_paths', 'on', true);
+            PERFORM set_config('client_min_messages',
+                CASE WHEN current_setting('topnbench.trace', true) = 'on'
+                     THEN 'debug1' ELSE 'warning' END, true);
+            PERFORM set_config('debug_print_projection_paths',
+                CASE WHEN current_setting('topnbench.trace', true) = 'on'
+                     THEN 'on' ELSE 'off' END, true);
             EXECUTE 'EXPLAIN (VERBOSE, COSTS ON, FORMAT JSON) ' || c.auto_query INTO saved_plan;
             PERFORM set_config('debug_print_projection_paths', 'off', true);
             PERFORM set_config('client_min_messages', saved_messages, true);

@@ -171,6 +171,7 @@ FROM pairs p JOIN topnbench_representation_cases c USING (case_id, variant_no)
 GROUP BY c.case_id, c.limit_rows, c.work_mem_setting, c.variant_no, c.variant
 ORDER BY c.case_id, c.variant_no;
 
+\if :topnbench_verbose
 \echo '== Observed Sort inputs and I/O (diagnostic executions, not timed samples) =='
 SELECT c.limit_rows, c.work_mem_setting, c.variant,
        jsonb_array_length(n.node#>'{Plans,0,Output}') AS sort_input_columns,
@@ -192,3 +193,5 @@ SELECT c.limit_rows, c.work_mem_setting, c.variant, r.batch,
        r.plan_nodes, r.sort_method, r.sort_space_type
 FROM topnbench_representation_runs r JOIN topnbench_representation_cases c
   USING (case_id, variant_no) ORDER BY c.case_id, r.batch, c.variant_no;
+
+\endif

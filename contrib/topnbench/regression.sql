@@ -102,8 +102,12 @@ BEGIN
         -- One fresh, plan-only natural query per policy.  Keep core tracing
         -- outside all timing loops and exclude the rewritten strategies.
         RAISE NOTICE 'topn-trace BEGIN case=% policy=%', wanted_case, policy_name;
-        PERFORM set_config('client_min_messages', 'debug1', true);
-        PERFORM set_config('debug_print_projection_paths', 'on', true);
+        PERFORM set_config('client_min_messages',
+                CASE WHEN current_setting('topnbench.trace', true) = 'on'
+                     THEN 'debug1' ELSE 'warning' END, true);
+        PERFORM set_config('debug_print_projection_paths',
+                CASE WHEN current_setting('topnbench.trace', true) = 'on'
+                     THEN 'on' ELSE 'off' END, true);
         EXECUTE 'EXPLAIN (COSTS ON, FORMAT JSON) ' || d.auto_query INTO saved_plan;
         PERFORM set_config('debug_print_projection_paths', 'off', true);
         PERFORM set_config('client_min_messages', saved_messages, true);

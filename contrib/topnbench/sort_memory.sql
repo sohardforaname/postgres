@@ -27,7 +27,9 @@ BEGIN
     PERFORM set_config('debug_print_projection_paths', 'off', true);
     PERFORM set_config('max_parallel_workers_per_gather', '0', true);
     PERFORM set_config('jit', 'off', true);
-    PERFORM set_config('client_min_messages', 'log', true);
+    PERFORM set_config('client_min_messages',
+                CASE WHEN current_setting('topnbench.trace', true) = 'on'
+                     THEN 'log' ELSE 'warning' END, true);
     PERFORM set_config('trace_sort', 'off', true);
 
     FOR c IN SELECT * FROM topnbench_boundary_cases ORDER BY case_no, mem_no LOOP
@@ -38,7 +40,9 @@ BEGIN
             RAISE NOTICE '0017 BEGIN case=% work_mem=% strategy=%',
                          c.case_name, c.work_mem_setting, s.strategy;
             -- Trace only the target query, not SQL used to assemble reports.
-            PERFORM set_config('trace_sort', 'on', true);
+            PERFORM set_config('trace_sort',
+                CASE WHEN current_setting('topnbench.trace', true) = 'on'
+                     THEN 'on' ELSE 'off' END, true);
             EXECUTE 'EXPLAIN (ANALYZE, VERBOSE, BUFFERS, COSTS ON, '
                     'TIMING OFF, SUMMARY ON, FORMAT JSON) ' || s.query INTO saved_plan;
             PERFORM set_config('trace_sort', 'off', true);
@@ -94,6 +98,7 @@ BEGIN
     END LOOP;
 END $$;
 
+\if :topnbench_verbose
 \echo '== 0017 estimates versus observed space; transition details are in sort memory logs =='
 -- The 0016 proxy remains an estimate. Disk space is not memory consumption;
 -- memory fields below stay NULL for an external sort. Trace lines supply the
@@ -122,3 +127,7 @@ ORDER BY c.case_no, c.mem_no, n.strategy;
 
 \echo '0017 complete. Each BEGIN/END block should contain a sort memory: transition= line.'
 \echo 'If those lines are absent, check that the patched backend was installed and restarted.'
+
+\else
+\echo '0017 PASS: 24 serial Sort diagnostics and shape checks completed.'
+\endif

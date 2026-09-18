@@ -1,5 +1,70 @@
 # topnbench
 
+## 0020: compare placements without changing the SQL or sort keys
+
+Apply after 0019, rebuild/install PostgreSQL and restart the test server.
+The extension C/API is unchanged. `benchmark.sql` includes the new
+`projection_placement.sql`; no separate file installation is needed beyond
+applying the complete patch in the source tree.
+
+0019 showed that disabling radix changed the early winner at 16/24MB into
+late, while heap controls remained stable. It also exposed a measurement
+confound: the forced-early rewrite adds sort keys and can use qsort-tuple,
+while the natural early query uses qsort-single. This increment measures
+both placements of the exact natural query before fitting any new costs.
+
+The temporary enum `debug_projection_placement = auto | early | late`
+defaults to auto. It filters the already-legal competing placements before
+ORDERED add_path pruning, only for top-level full-Sort paths with parallel
+planning disabled and no target SRFs. It does not change sort keys, costs,
+target construction or the default policy. Unaffected paths and hooks keep
+normal treatment, so this is not a universal force-plan facility; the test
+requires the requested actual shape. Existing semantic restrictions on the
+POC's early/late competition still apply.
+
+Seven existing cells are reused: cost-1-work-16 at all six memory budgets,
+and limit-90pct at 256MB. Radix is enabled throughout. Each of six batches
+runs the same natural SQL in auto, early and late modes, using all six mode
+orders equally and reversing cell order. There are 126 measure calls, each
+with three timed samples; no rewritten early/late SQL is used for timing.
+The seven-row summary reports both final Limit costs, paired time ratios,
+actual methods and winner counts. Full plans and per-batch measurements
+remain in TEMP tables.
+
+Result verification executes each whole SELECT via CTAS under its own mode,
+checks its root plan matches the direct SELECT, and compares stored results
+with EXCEPT ALL. Wrapping the queries directly inside EXCEPT would otherwise
+bypass the top-level-only switch. Guards check one sort key, one serial full
+Sort over the million-row Seq Scan and the requested projection position.
+Four excluded-shape plan checks cover no LIMIT, volatile output, target SRF
+and a bounded subquery. All experiment-local settings restore on error or
+success. Final total costs already include LIMIT and must not be prorated
+again. This patch introduces no cost coefficient or memory formula changes.
+
+### Compact output and full diagnostics
+
+The default entrypoint suppresses routine command tags/notices, disables
+planner/sort tracing and omits large detail tables. Measurements, actual-plan
+collection, equivalence checks and correctness guards still execute. It
+retains summaries, wrong-choice reports and PASS output. Run normally:
+
+```
+psql -X -v ON_ERROR_STOP=1 -f contrib/topnbench/benchmark.sql > topnbench-0020.log 2>&1
+```
+
+Use the existing flag for all detailed tables and tracing:
+
+```
+psql -X -v ON_ERROR_STOP=1 -v topnbench_verbose=true -f contrib/topnbench/benchmark.sql > topnbench-0020-full.log 2>&1
+```
+
+Internal tracing uses the session custom setting `topnbench.trace`, set by
+the entrypoint. Standalone heap_release.sql still works without this setting;
+set it to on before running that file if transition logs are required.
+Trace/diagnostic executions never contribute timing samples. Historical
+instructions below describing unconditional trace output predate 0020.
+
+
 ## 0019: separate radix dispatch from sort-memory boundaries
 
 Apply after 0018, rebuild/install PostgreSQL and restart the test server.

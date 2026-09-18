@@ -10,8 +10,14 @@
 \endif
 \if :topnbench_verbose
 \timing on
+\set QUIET off
+SET client_min_messages = notice;
+SET topnbench.trace = on;
 \else
 \timing off
+\set QUIET on
+SET client_min_messages = warning;
+SET topnbench.trace = off;
 \endif
 
 \echo
@@ -23,6 +29,7 @@ SET debug_print_projection_paths = off;
 SET enable_projection_total_cost = on;
 SET trace_sort = off;
 SET debug_disable_sort_radix = off;
+SET debug_projection_placement = auto;
 
 DROP EXTENSION IF EXISTS topnbench;
 CREATE EXTENSION topnbench;
@@ -1298,6 +1305,8 @@ ORDER BY c.case_order;
 \ir sort_boundary.sql
 
 \ir sort_algorithm.sql
+
+\ir projection_placement.sql
 
 -- Keep execution tracing after every timed section.
 \ir sort_memory.sql

@@ -745,6 +745,15 @@
   boot_val => 'false',
 },
 
+{ name => 'debug_projection_placement', type => 'enum', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Selects a competing serial projection placement for temporary testing.',
+  long_desc => 'Applies only to eligible top-level full-Sort paths with parallel planning disabled. Costs and sort keys are unchanged.',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_EXPLAIN',
+  variable => 'debug_projection_placement',
+  boot_val => 'DEBUG_PROJECTION_AUTO',
+  options => 'debug_projection_placement_options',
+},
+
 { name => 'debug_raw_expression_coverage_test', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Set this to force all raw parse trees for DML statements to be scanned by raw_expression_tree_walker(), to facilitate catching errors and omissions in that function.',
   flags => 'GUC_NOT_IN_SAMPLE',
