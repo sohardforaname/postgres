@@ -200,6 +200,7 @@ static bool estimate_union_all_join_rows(PlannerInfo *root,
 										List *restrictlist, double *rows);
 static Var *union_all_join_var(Node *node);
 static bool union_all_join_has_mcv(PlannerInfo *root, Node *node, Oid opfunc);
+static bool union_all_join_unfiltered_base(PlannerInfo *root, RelOptInfo *rel);
 static double calc_joinrel_size_estimate(PlannerInfo *root,
 										 RelOptInfo *joinrel,
 										 RelOptInfo *outer_rel,
@@ -5814,6 +5815,32 @@ union_all_join_has_mcv(PlannerInfo *root, Node *node, Oid opfunc)
 }
 
 /*
+ * Reject inputs whose row filtering can invalidate the base-column MCVs.
+ * Scaling the row count does not condition the value frequencies: a filter
+ * on another column can remove precisely the keys that dominate the MCV list.
+ * Do not attempt to prove independence, even for apparently unrelated Vars.
+ *
+ * A retained subquery/CTE can hide filters below this query level, so require
+ * a plain relation here rather than relying on its empty baserestrictinfo.
+ * This also deliberately gives up statistics passthrough from unfiltered
+ * retained subqueries.  Pulled-up simple projections remain eligible.
+ *
+ * This guard is not a model of intermediate join distributions.  An existing
+ * joinrel can still change key frequencies even when all its bases pass.
+ */
+static bool
+union_all_join_unfiltered_base(PlannerInfo *root, RelOptInfo *rel)
+{
+	RangeTblEntry *rte;
+
+	if (!IS_SIMPLE_REL(rel) || rel->rtekind != RTE_RELATION ||
+		rel->baserestrictinfo != NIL)
+		return false;
+	rte = root->simple_rte_array[rel->relid];
+	return rte->tablesample == NULL && rte->securityQuals == NIL;
+}
+
+/*
  * Estimate an inner equijoin with a flattened UNION ALL on one side.
  *
  * An appendrel made from UNION ALL has no column statistics of its own.
@@ -5824,7 +5851,8 @@ union_all_join_has_mcv(PlannerInfo *root, Node *node, Oid opfunc)
  *
  * This is deliberately limited to a direct UNION ALL input and simple
  * column equalities with usable MCV lists on both sides for every live
- * child.  Missing MCVs cause whole-call fallback, not mixed estimates.  We do
+ * child.  Base restrictions and opaque inputs also cause whole-call fallback.
+ * Missing MCVs cause whole-call fallback, not mixed estimates.  We do
  * not recurse into another UNION ALL, change outer/semi/anti join estimates,
  * or estimate parameterized paths this way.  The latter may have a different
  * mixture of child rows, which cannot be inferred from the path's total rows.
@@ -5848,6 +5876,7 @@ estimate_union_all_join_rows(PlannerInfo *root,
 	int			nchildren = 0;
 	int			nattrs = 0;
 	int			nclauses = list_length(restrictlist);
+	int			relid;
 	int			i;
 	ListCell   *lc;
 	double		nrows = 0;
@@ -5874,13 +5903,26 @@ estimate_union_all_join_rows(PlannerInfo *root,
 			return false;
 		appendrel = inner_rel;
 	}
-	if (appendrel == NULL || IS_DUMMY_REL(appendrel))
+	if (appendrel == NULL || IS_DUMMY_REL(appendrel) ||
+		appendrel->baserestrictinfo != NIL)
 		return false;
 
 	append_on_left = (appendrel == outer_rel);
 	otherrel = append_on_left ? inner_rel : outer_rel;
 	if (IS_DUMMY_REL(otherrel))
 		return false;
+
+	/* A filtered non-key input can also change an existing joinrel's keys. */
+	relid = -1;
+	while ((relid = bms_next_member(otherrel->relids, relid)) >= 0)
+	{
+		/* Outer-join relids need not name a simple relation. */
+		if (relid <= 0 || relid >= root->simple_rel_array_size ||
+			root->simple_rel_array[relid] == NULL ||
+			!union_all_join_unfiltered_base(root,
+												 root->simple_rel_array[relid]))
+			return false;
+	}
 
 	/* Accept only equalities connecting the appendrel to the other input. */
 	foreach(lc, restrictlist)
@@ -5893,7 +5935,6 @@ estimate_union_all_join_rows(PlannerInfo *root,
 		Var		   *othervar;
 		Node	   *otherexpr;
 		Oid			opfunc;
-		RangeTblEntry *otherrte;
 
 		if (!is_opclause(rinfo->clause))
 			return false;
@@ -5909,9 +5950,6 @@ estimate_union_all_join_rows(PlannerInfo *root,
 		othervar = parentvar == leftvar ? rightvar : leftvar;
 		if (parentvar->varno != appendrel->relid ||
 			!bms_is_member(othervar->varno, otherrel->relids))
-			return false;
-		otherrte = root->simple_rte_array[othervar->varno];
-		if (otherrte->rtekind == RTE_SUBQUERY && otherrte->inh)
 			return false;
 		opfunc = get_opcode(op->opno);
 		otherexpr = parentvar == leftvar ? lsecond(op->args) : linitial(op->args);
@@ -5935,18 +5973,14 @@ estimate_union_all_join_rows(PlannerInfo *root,
 	{
 		AppendRelInfo *appinfo = lfirst_node(AppendRelInfo, lc);
 		RelOptInfo *childrel;
-		RangeTblEntry *childrte;
 
 		if (appinfo->parent_relid != appendrel->relid)
 			continue;
 		childrel = find_base_rel(root, appinfo->child_relid);
 		if (IS_DUMMY_REL(childrel))
 			continue;
-		childrte = root->simple_rte_array[appinfo->child_relid];
 		if (!bms_is_empty(childrel->lateral_relids) ||
-			(childrte->rtekind != RTE_RELATION &&
-			 childrte->rtekind != RTE_SUBQUERY) ||
-			(childrte->rtekind == RTE_SUBQUERY && childrte->inh))
+			!union_all_join_unfiltered_base(root, childrel))
 			return false;
 
 		for (i = 0; i < nattrs; i++)

@@ -1,16 +1,26 @@
--- 0011: incremental on 0010; changes costsize.c and this sole root SQL.
--- Rebuild, install and restart the server before running.
---   psql -X -v ON_ERROR_STOP=1 -d YOUR_TEST_DB -f union_all_join_test.sql > union-all-0011.log 2>&1
--- The prototype now requires usable MCV slots on both sides of every equality.
--- Missing slots or denied operator statistics access cause whole-call fallback.
--- This is deliberately narrower eligibility, not a complete statistics model.
--- Uniform/unique/all-NULL columns without MCVs may now use the old estimates.
--- Keeps the 120-case matrix but pins the same 16 cases executed under 0010.
--- Prints actual MCV/NDV state, independent-arm estimates, and cases 7/10/40/41.
--- No promise that MCV presence resolves filtered-joinrel or multi-column errors.
--- Existing correctness checks retained; boundaries distinguish MCV/fallback inputs.
--- 2 warmups + 8 alternating measurements per mode; temporary objects, ROLLBACK.
--- The assistant has not compiled or executed this revision.
+-- 0013: incremental on 0012. Rebuild/restart your patched server before running.
+-- Adds conservative filter fallback and targeted plan-choice diagnostics.
+-- Filtered base inputs and retained subqueries now fall back as a whole;
+-- this does not model filtered or intermediate-join value distributions.
+--   psql -X -v ON_ERROR_STOP=1 -d YOUR_TEST_DB -f union_all_join_test.sql > union-all-0013.log 2>&1
+-- Retains the 152-case screen, all 32 boundary cases, and old regression cohorts.
+-- Pins cases 67..72 even if their natural plans stop switching.
+-- Adds natural/nested-only/hash-only/lateral-probe diagnostics for 67..72.
+-- Method switches affect the entire plan; compare the printed child shapes.
+-- The equivalent LATERAL query constrains the final probe, but is a SQL rewrite,
+-- not a cost observation of an unchosen path in the original search.
+-- Executes ALL current plan-switch cases, plus all 32 new MCV boundary cases.
+-- New cases: target 1/1000, unfiltered/child filter/other filter/correlated keys,
+-- fixed/free join order, work_mem 64kB/16MB. Lower memory permits, not guarantees,
+-- hash batching/sort spill. Plans, buffer traffic and spill counters are reported.
+-- MCV presence does not establish accuracy: compare observed MCV coverage,
+-- result bags, row estimates and off/on timings. No performance pass threshold.
+-- 2 warmups + 8 alternating samples per mode for each executed case.
+-- The diagnostics add 384 measured executions plus warmups and bag checks.
+-- Allow additional runtime and temporary disk space.
+-- One root SQL, temporary objects/settings only, transaction ends with ROLLBACK.
+-- Synthetic serial warmed-data tests, not a production benchmark.
+-- No PostgreSQL compilation or SQL execution by the assistant.
 \set ON_ERROR_STOP 1
 \pset pager off
 \echo === UNION ALL test: start ===
@@ -89,12 +99,7 @@ SELECT pg_temp.ua_assert_sum('multiple equalities, product within each child',
     'SELECT a.k FROM ua_a a JOIN ua_d d ON a.k = d.k AND a.j = d.j',
     'SELECT b.k FROM ua_b b JOIN ua_d d ON b.k = d.k AND b.j = d.j');
 
-SELECT pg_temp.ua_assert_sum('filtered subquery arms',
-    'SELECT u.k FROM (SELECT k FROM ua_a WHERE keep
-                     UNION ALL SELECT k FROM ua_b WHERE keep) u
-     JOIN ua_d d ON u.k = d.k',
-    'SELECT a.k FROM ua_a a JOIN ua_d d ON a.k = d.k WHERE a.keep',
-    'SELECT b.k FROM ua_b b JOIN ua_d d ON b.k = d.k WHERE b.keep');
+-- The filtered-arm fixture is retained below as a full-plan fallback check.
 
 SELECT pg_temp.ua_assert_sum('pruned child',
     'SELECT u.k FROM (SELECT k FROM ua_a
@@ -599,7 +604,7 @@ BEGIN
 END
 $func$;
 
-\echo === 0011: MCV eligibility, not merely statistics-tuple presence ===
+\echo === 0013: MCV eligibility, not merely statistics-tuple presence ===
 CREATE FUNCTION pg_temp.ua_expect_mcv(p_table text, p_column text, p_expected boolean)
 RETURNS void LANGUAGE plpgsql AS $func$
 DECLARE
@@ -638,7 +643,7 @@ BEGIN
     END LOOP;
     IF p_fallback THEN
         IF off_plan IS DISTINCT FROM on_plan THEN
-            RAISE EXCEPTION '%: missing-MCV fallback changed full Plan',p_label
+            RAISE EXCEPTION '%: guarded fallback changed full Plan',p_label
                 USING DETAIL='off='||off_plan::text||', on='||on_plan::text;
         END IF;
     ELSIF (on_plan->>'Plan Rows')::numeric<>p_expected OR
@@ -671,6 +676,70 @@ SELECT pg_temp.ua_mcv_guard_case('one child has stats but no MCV',
     'SELECT u.k FROM (SELECT k FROM ua_a UNION ALL SELECT k FROM ua_mcv_unique) u JOIN ua_mcv_four d ON u.k=d.k',404,true);
 SELECT pg_temp.ua_mcv_guard_case('both sides have MCV: retain improvement',
     'SELECT u.k FROM ua_v u JOIN ua_mcv_four d ON u.k=d.k',400,false);
+
+-- 0013: full Plan equality checks cover both cardinality and match-pair costs.
+-- Keep the original filtered-arm fixture: it is now intentionally a fallback,
+-- even though this particular filter happens to preserve the key frequencies.
+\echo === 0013 filtered/opaque inputs: full-plan fallback ===
+SELECT pg_temp.ua_mcv_guard_case('filtered subquery arms',
+    'SELECT u.k FROM (SELECT k FROM ua_a WHERE keep
+                     UNION ALL SELECT k FROM ua_b WHERE keep) u
+     JOIN ua_d d ON u.k=d.k',2500,true);
+SELECT pg_temp.ua_mcv_guard_case('only one live child filtered',
+    'SELECT u.k FROM (SELECT k FROM ua_a WHERE keep
+                     UNION ALL SELECT k FROM ua_b) u
+     JOIN ua_d d ON u.k=d.k',2500,true);
+SELECT pg_temp.ua_mcv_guard_case('filter pushed from union parent',
+    'SELECT u.k FROM ua_v u JOIN ua_d d ON u.k=d.k WHERE u.keep',2500,true);
+SELECT pg_temp.ua_mcv_guard_case('other input filter on correlated non-key column',
+    'SELECT u.k FROM ua_v u JOIN ua_d d ON u.k=d.k WHERE d.j=1',4000,true);
+SELECT pg_temp.ua_mcv_guard_case('reversed filtered other input',
+    'SELECT u.k FROM ua_d d JOIN ua_v u ON d.k=u.k WHERE d.j=1',4000,true);
+SELECT pg_temp.ua_mcv_guard_case('filter hidden inside retained child',
+    'SELECT u.k FROM ((SELECT k FROM ua_a WHERE keep OFFSET 0)
+                     UNION ALL SELECT k FROM ua_b) u
+     JOIN ua_d d ON u.k=d.k',2500,true);
+SELECT pg_temp.ua_mcv_guard_case('filter hidden inside retained other input',
+    'SELECT u.k FROM ua_v u JOIN (SELECT * FROM ua_d WHERE j=1 OFFSET 0) d
+     ON u.k=d.k',4000,true);
+SELECT pg_temp.ua_mcv_guard_case('unfiltered retained child: conservative fallback',
+    'SELECT u.k FROM ((SELECT k FROM ua_a OFFSET 0)
+                     UNION ALL SELECT k FROM ua_b) u
+     JOIN ua_d d ON u.k=d.k',5000,true);
+SELECT pg_temp.ua_mcv_guard_case('unfiltered retained other input: conservative fallback',
+    'SELECT u.k FROM ua_v u JOIN (SELECT * FROM ua_d OFFSET 0) d
+     ON u.k=d.k',5000,true);
+
+SELECT pg_temp.ua_mcv_guard_case('filter hidden inside materialized CTE',
+    'WITH d AS MATERIALIZED (SELECT * FROM ua_d WHERE j=1)
+     SELECT u.k FROM ua_v u JOIN d ON u.k=d.k',4000,true);
+SELECT pg_temp.ua_mcv_guard_case('sampled child: conservative fallback even at 100 percent',
+    'SELECT u.k FROM (SELECT k FROM ua_a TABLESAMPLE SYSTEM (100) REPEATABLE (1)
+                     UNION ALL SELECT k FROM ua_b) u
+     JOIN ua_d d ON u.k=d.k',5000,true);
+SELECT pg_temp.ua_mcv_guard_case('sampled other input: conservative fallback',
+    'SELECT u.k FROM ua_v u JOIN ua_d d TABLESAMPLE SYSTEM (100) REPEATABLE (1)
+     ON u.k=d.k',5000,true);
+
+SET LOCAL join_collapse_limit = 1;
+SELECT pg_temp.ua_mcv_guard_case('filtered non-key member of other joinrel',
+    'SELECT u.k FROM ua_d d JOIN ua_d e ON d.k=e.k
+     JOIN ua_v u ON u.k=d.k WHERE e.j=1',160000,true);
+SET LOCAL join_collapse_limit = 8;
+
+-- Full-plan equality must also hold when Hash/Merge costing is exercised.
+SET LOCAL enable_mergejoin = off;
+SET LOCAL enable_nestloop = off;
+SELECT pg_temp.ua_mcv_guard_case('filtered union: hash costing fallback',
+    'SELECT u.k FROM ua_v u JOIN ua_d d ON u.k=d.k WHERE u.keep',2500,true);
+SET LOCAL enable_hashjoin = off;
+SET LOCAL enable_mergejoin = on;
+SELECT pg_temp.ua_mcv_guard_case('filtered other input: merge costing fallback',
+    'SELECT u.k FROM ua_v u JOIN ua_d d ON u.k=d.k WHERE d.j=1',4000,true);
+SET LOCAL enable_hashjoin = on;
+SET LOCAL enable_nestloop = on;
+-- Existing basic, pruned-child and unfiltered multi-join assertions above
+-- remain positive controls; timings are never asserted as pass/fail.
 
 -- Retain the old two-row unique-child fixture as a new fallback check.
 -- The separate branch-limit fixture below now duplicates each key to have MCVs.
@@ -1184,11 +1253,13 @@ END
 $test$;
 
 \echo === 0009: inspect REVIEW rows above; assertion success does not mean no timing regressions ===
-\echo === 0011: plan competition, screen first and then execute selected pairs ===
+\echo === 0013: plan competition, screen first and then execute selected pairs ===
 CREATE TEMP TABLE ua_comp_cases (
     case_id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     hot_rows int, fanout int, probe_rows int, collapse_limit int,
-    random_cost numeric, expected_rows bigint, query_text text
+    random_cost numeric, expected_rows bigint, query_text text,
+    case_label text NOT NULL DEFAULT 'original_matrix',
+    work_mem_setting text NOT NULL DEFAULT '16MB'
 );
 CREATE TEMP TABLE ua_comp_screen (
     case_id int, mode text, shape jsonb, document jsonb,
@@ -1263,7 +1334,7 @@ BEGIN
 END
 $build$;
 
-\echo === 0011 actual column statistics (n_distinct is raw pg_stats notation) ===
+\echo === 0013 actual column statistics (n_distinct is raw pg_stats notation) ===
 SELECT tablename,attname,null_frac,n_distinct,
        most_common_vals IS NOT NULL AS has_mcv,
        coalesce(cardinality(most_common_freqs),0) AS mcv_items,
@@ -1325,9 +1396,106 @@ BEGIN
     PERFORM set_config('enable_union_all_join_estimates',old_feature,true);
 END
 $func$;
-\echo === 0011 isolated first join: union versus independently planned children ===
+\echo === 0013 isolated first join: union versus independently planned children ===
 SELECT d.* FROM (VALUES(100,1),(100,4),(1000,1),(1000,4)) c(hot,copies)
 CROSS JOIN LATERAL pg_temp.ua_mcv_probe(c.hot,c.copies) d ORDER BY hot_rows,fanout,mode;
+
+\echo === 0013 build partial-MCV and conditional-distribution cases ===
+DO $boundary$
+DECLARE
+    target int;
+    side text;
+    table_name text;
+    key_sql text;
+    family text;
+    predicate_sql text;
+    memory_setting text;
+    collapse int;
+    expected bigint;
+    query_sql text;
+BEGIN
+    CREATE TEMP TABLE ua_ext_probe AS
+        SELECT i AS id, i%97 AS v, repeat('p',64) AS padding
+        FROM generate_series(1,120000) g(i);
+    ALTER TABLE ua_ext_probe ADD PRIMARY KEY(id);
+    ANALYZE ua_ext_probe;
+    FOREACH target IN ARRAY ARRAY[1,1000] LOOP
+        FOREACH side IN ARRAY ARRAY['a','b'] LOOP
+            table_name:=format('ua_ext_%s_%s',side,target);
+            IF side='a' THEN
+                key_sql:='CASE WHEN i<=10000 THEN 1 WHEN i<=14000 THEN 2 ELSE (i-14001)%700+3 END';
+            ELSE
+                key_sql:='CASE WHEN i<=10000 THEN 2 WHEN i<=14000 THEN 1 ELSE (i-14001)%700+703 END';
+            END IF;
+            EXECUTE format('CREATE TEMP TABLE %I AS SELECT ((i*7919::bigint) %% 21000 + 1)::int + %s AS id, k, k AS j, k>=3 AS keep FROM (SELECT i, %s AS k FROM generate_series(1,21000) g(i)) x',
+                table_name,CASE WHEN side='a' THEN 0 ELSE 21000 END,key_sql);
+            EXECUTE format('CREATE INDEX ON %I(id)',table_name);
+            EXECUTE format('ALTER TABLE %I ALTER COLUMN k SET STATISTICS %s',table_name,target);
+            EXECUTE format('ALTER TABLE %I ALTER COLUMN j SET STATISTICS %s',table_name,target);
+            EXECUTE format('ANALYZE %I',table_name);
+            PERFORM pg_temp.ua_expect_mcv(table_name,'k',true);
+            PERFORM pg_temp.ua_expect_mcv(table_name,'j',true);
+        END LOOP;
+        table_name:='ua_ext_d_'||target;
+        EXECUTE format('CREATE TEMP TABLE %I AS SELECT i AS tag, k, k AS j, k>=3 AS pick FROM (SELECT i, CASE WHEN i<=8 THEN 1 WHEN i<=12 THEN 2 ELSE i-10 END AS k FROM generate_series(1,20) g(i)) x',table_name);
+        EXECUTE format('ALTER TABLE %I ALTER COLUMN k SET STATISTICS %s',table_name,target);
+        EXECUTE format('ALTER TABLE %I ALTER COLUMN j SET STATISTICS %s',table_name,target);
+        EXECUTE format('ANALYZE %I',table_name);
+        PERFORM pg_temp.ua_expect_mcv(table_name,'k',true);
+        PERFORM pg_temp.ua_expect_mcv(table_name,'j',true);
+        EXECUTE format('CREATE TEMP VIEW %I AS SELECT * FROM %I UNION ALL SELECT * FROM %I',
+            'ua_ext_u_'||target,'ua_ext_a_'||target,'ua_ext_b_'||target);
+        FOREACH family IN ARRAY ARRAY['unfiltered','child_filter','other_filter','correlated_keys'] LOOP
+            predicate_sql:=CASE family
+                WHEN 'child_filter' THEN ' WHERE u.keep'
+                WHEN 'other_filter' THEN ' WHERE d.pick'
+                ELSE '' END;
+            -- 14k rows per hot key across the union: 14k*8 + 14k*4.
+            -- Tail keys 3..10 appear ten times each in arm a: another 80.
+            expected:=CASE WHEN family IN ('child_filter','other_filter') THEN 80 ELSE 168080 END;
+            query_sql:=format('SELECT u.id, d.tag, p.v FROM %I u JOIN %I d ON u.k=d.k%s JOIN ua_ext_probe p ON u.id=p.id%s',
+                'ua_ext_u_'||target,'ua_ext_d_'||target,
+                CASE WHEN family='correlated_keys' THEN ' AND u.j=d.j' ELSE '' END,predicate_sql);
+            FOREACH collapse IN ARRAY ARRAY[1,8] LOOP
+                FOREACH memory_setting IN ARRAY ARRAY['64kB','16MB'] LOOP
+                    INSERT INTO ua_comp_cases(hot_rows,fanout,probe_rows,collapse_limit,
+                        random_cost,expected_rows,query_text,case_label,work_mem_setting)
+                    VALUES(NULL,NULL,120000,collapse,4,expected,query_sql,
+                        format('target_%s_%s',target,family),memory_setting);
+                END LOOP;
+            END LOOP;
+        END LOOP;
+    END LOOP;
+END
+$boundary$;
+
+-- Larger target is not assumed to give complete MCV coverage. Print actual
+-- slot size and frequency mass; never use these observations as exactness claims.
+\echo === 0013 observed MCV coverage for added cases ===
+SELECT tablename,attname,n_distinct,cardinality(most_common_freqs) AS mcv_items,
+       round((SELECT sum(f)::numeric FROM unnest(most_common_freqs) f),6) AS mcv_mass,
+       left(most_common_vals::text,80) AS first_mcv_values
+FROM pg_stats
+WHERE schemaname=(SELECT nspname FROM pg_namespace WHERE oid=pg_my_temp_schema())
+  AND NOT inherited AND tablename LIKE 'ua_ext_%' AND attname IN ('k','j')
+ORDER BY tablename,attname;
+
+-- Assert that target=1 really exercises incomplete MCV coverage, not only
+-- that a statistics tuple exists. Do not assert a particular high-target plan.
+DO $coverage$
+DECLARE
+    n int;
+BEGIN
+    SELECT count(*) INTO n FROM pg_stats
+    WHERE schemaname=(SELECT nspname FROM pg_namespace WHERE oid=pg_my_temp_schema())
+      AND NOT inherited AND tablename IN ('ua_ext_a_1','ua_ext_b_1','ua_ext_d_1')
+      AND attname IN ('k','j') AND cardinality(most_common_freqs)=1
+      AND (SELECT sum(f) FROM unnest(most_common_freqs) f)<0.99;
+    IF n<>6 THEN
+        RAISE EXCEPTION '0013 partial-MCV fixture missing: expected six columns, got %',n;
+    END IF;
+END
+$coverage$;
 
 -- Record and restore settings so the screen and every timed pair use identical
 -- costs and join-search limits. All algorithms remain available in both modes.
@@ -1339,10 +1507,12 @@ DECLARE
     old_feature text := current_setting('enable_union_all_join_estimates');
     old_collapse text := current_setting('join_collapse_limit');
     old_rpc text := current_setting('random_page_cost');
+    old_memory text := current_setting('work_mem');
 BEGIN
     FOR c IN SELECT * FROM ua_comp_cases ORDER BY case_id LOOP
         PERFORM set_config('join_collapse_limit',c.collapse_limit::text,true);
         PERFORM set_config('random_page_cost',c.random_cost::text,true);
+        PERFORM set_config('work_mem',c.work_mem_setting,true);
         FOREACH mode IN ARRAY ARRAY['off','on'] LOOP
             PERFORM set_config('enable_union_all_join_estimates',mode,true);
             EXECUTE 'EXPLAIN (FORMAT JSON) '||c.query_text INTO doc;
@@ -1355,6 +1525,7 @@ BEGIN
     PERFORM set_config('enable_union_all_join_estimates',old_feature,true);
     PERFORM set_config('join_collapse_limit',old_collapse,true);
     PERFORM set_config('random_page_cost',old_rpc,true);
+    PERFORM set_config('work_mem',old_memory,true);
 END
 $screen$;
 
@@ -1387,33 +1558,60 @@ BEGIN
 END
 $guard$;
 
--- Pin the original 0010 execution cohort. Repaired cases must not disappear
--- from execution merely because their plans no longer differ.
+-- All sixteen filtered boundary cases must keep the entire original Plan.
+-- Checking costs as well as rows catches a missed approx_tuple_count fallback.
+DO $filter_guard$
+DECLARE
+    checked int;
+BEGIN
+    SELECT count(*) INTO checked FROM ua_comp_pairs
+    WHERE case_label ~ '_(child|other)_filter$';
+    IF checked<>16 OR EXISTS (
+        SELECT 1 FROM ua_comp_pairs c JOIN ua_comp_screen a USING(case_id)
+        JOIN ua_comp_screen b USING(case_id)
+        WHERE c.case_label ~ '_(child|other)_filter$'
+          AND a.mode='off' AND b.mode='on'
+          AND (a.document->0->'Plan') IS DISTINCT FROM (b.document->0->'Plan')
+    ) THEN
+        RAISE EXCEPTION '0013 filtered-boundary full-plan fallback mismatch';
+    END IF;
+    RAISE NOTICE '0013 PASS: all 16 filtered boundary Plan pairs identical';
+END
+$filter_guard$;
+
+-- Execute every current switch, every new boundary case, and the fixed
+-- regression/control cohort. A repaired case cannot disappear from the run.
 CREATE TEMP TABLE ua_comp_selected AS
-SELECT case_id, CASE WHEN case_id IN (13,14,16,17) THEN '0010 improvement'
+SELECT case_id, CASE WHEN case_id>120 THEN 'new MCV boundary'
+                     WHEN case_id BETWEEN 67 AND 72 THEN '0012 accurate-rows regression'
+                     WHEN case_id IN (13,14,16,17) THEN '0010 improvement'
                      WHEN case_id IN (19,37,43,61) THEN '0010 control'
-                     ELSE '0010 regression' END AS selection_reason
-FROM ua_comp_cases WHERE case_id IN (1,2,4,7,8,10,13,14,16,17,19,37,40,41,43,61);
+                     WHEN case_id IN (1,2,4,7,8,10,40,41) THEN '0010 regression'
+                     ELSE 'additional current switch' END AS selection_reason
+FROM ua_comp_pairs
+WHERE plan_changed OR case_id>120 OR case_id IN (1,2,4,7,8,10,13,14,16,17,19,37,40,41,43,61,67,68,69,70,71,72);
 ALTER TABLE ua_comp_selected ADD PRIMARY KEY(case_id);
 
-\echo === 0011 screen coverage (planning only for unselected cases) ===
-SELECT collapse_limit,random_cost,count(*) AS screened,
+\echo === 0013 screen coverage (planning only for unselected cases) ===
+SELECT case_label,collapse_limit,random_cost,work_mem_setting,count(*) AS screened,
        count(*) FILTER(WHERE plan_changed) AS changed,
        count(*) FILTER(WHERE NOT plan_changed) AS unchanged,
        count(*) FILTER(WHERE case_id IN (SELECT case_id FROM ua_comp_selected)) AS selected
-FROM ua_comp_pairs GROUP BY collapse_limit,random_cost ORDER BY collapse_limit,random_cost;
+FROM ua_comp_pairs GROUP BY case_label,collapse_limit,random_cost,work_mem_setting
+ORDER BY case_label,collapse_limit,random_cost,work_mem_setting;
 
-\echo === 0011 selected workload parameters / root estimates (not timing results) ===
-SELECT p.case_id,s.selection_reason,p.hot_rows,p.fanout,p.probe_rows,p.collapse_limit,
+\echo === 0013 selected workload parameters / root estimates (not timing results) ===
+SELECT p.case_id,s.selection_reason,p.case_label,p.work_mem_setting,
+       p.hot_rows,p.fanout,p.probe_rows,p.collapse_limit,
        p.random_cost,p.off_root,p.on_root,p.off_rows,p.on_rows,p.expected_rows,
        p.off_cost,p.on_cost
 FROM ua_comp_pairs p JOIN ua_comp_selected s USING(case_id) ORDER BY p.case_id;
 
 DO $coverage$
 BEGIN
-    IF (SELECT count(*) FROM ua_comp_cases)<>120 OR
-       (SELECT count(*) FROM ua_comp_screen)<>240 THEN
-        RAISE EXCEPTION '0011 incomplete plan screen';
+    IF (SELECT count(*) FROM ua_comp_cases)<>152 OR
+       (SELECT count(*) FROM ua_comp_screen)<>304 THEN
+        RAISE EXCEPTION '0013 incomplete plan screen';
     END IF;
     IF NOT EXISTS(SELECT 1 FROM ua_comp_pairs WHERE plan_changed) THEN
         RAISE NOTICE 'COVERAGE NOTE: no current plan switches; fixed 0010 cohort still checks the repaired cases';
@@ -1434,11 +1632,13 @@ DECLARE
     old_feature text := current_setting('enable_union_all_join_estimates');
     old_collapse text := current_setting('join_collapse_limit');
     old_rpc text := current_setting('random_page_cost');
+    old_memory text := current_setting('work_mem');
 BEGIN
     FOR c IN SELECT p.* FROM ua_comp_cases p JOIN ua_comp_selected s USING(case_id)
              ORDER BY p.case_id LOOP
         PERFORM set_config('join_collapse_limit',c.collapse_limit::text,true);
         PERFORM set_config('random_page_cost',c.random_cost::text,true);
+        PERFORM set_config('work_mem',c.work_mem_setting,true);
         PERFORM set_config('enable_union_all_join_estimates','off',true);
         EXECUTE 'CREATE TEMP TABLE ua_comp_off AS '||c.query_text;
         PERFORM set_config('enable_union_all_join_estimates','on',true);
@@ -1451,12 +1651,12 @@ BEGIN
             (SELECT * FROM ua_comp_on EXCEPT ALL SELECT * FROM ua_comp_off)
         ) delta) INTO different;
         IF different OR off_count<>c.expected_rows OR on_count<>c.expected_rows THEN
-            RAISE EXCEPTION '0011 case %: bag mismatch %, off %, on %, expected %',
+            RAISE EXCEPTION '0013 case %: bag mismatch %, off %, on %, expected %',
                 c.case_id,different,off_count,on_count,c.expected_rows;
         END IF;
         INSERT INTO ua_comp_correctness VALUES(c.case_id,on_count,true);
         DROP TABLE ua_comp_off,ua_comp_on;
-        RAISE NOTICE '0011 case %: exact result PASS (% rows); measuring',c.case_id,on_count;
+        RAISE NOTICE '0013 case %: exact result PASS (% rows); measuring',c.case_id,on_count;
         FOR sample IN 1..10 LOOP
             modes := CASE WHEN sample%2=1 THEN ARRAY['off','on'] ELSE ARRAY['on','off'] END;
             FOREACH mode IN ARRAY modes LOOP
@@ -1465,7 +1665,7 @@ BEGIN
                     ||c.query_text INTO doc;
                 IF (doc->0->'Plan'->>'Actual Rows')::numeric<>c.expected_rows OR
                    (doc->0->'Plan'->>'Actual Loops')::numeric<>1 THEN
-                    RAISE EXCEPTION '0011 case % / %: measured rows/loops mismatch',c.case_id,mode;
+                    RAISE EXCEPTION '0013 case % / %: measured rows/loops mismatch',c.case_id,mode;
                 END IF;
                 IF sample>2 THEN
                     INSERT INTO ua_comp_samples VALUES(c.case_id,mode,sample-2,
@@ -1479,6 +1679,7 @@ BEGIN
     PERFORM set_config('enable_union_all_join_estimates',old_feature,true);
     PERFORM set_config('join_collapse_limit',old_collapse,true);
     PERFORM set_config('random_page_cost',old_rpc,true);
+    PERFORM set_config('work_mem',old_memory,true);
 END
 $execute$;
 
@@ -1515,7 +1716,7 @@ FROM ua_comp_pairs p JOIN ua_comp_summary a USING(case_id)
 JOIN ua_comp_summary b USING(case_id) JOIN paired r USING(case_id)
 WHERE a.mode='off' AND b.mode='on';
 
-\echo === 0011 timing: positive delta = slower; speedup >1 = faster ===
+\echo === 0013 timing: positive delta = slower; speedup >1 = faster ===
 SELECT case_id,screened_switch,measured_switch,
        round(off_ms::numeric,3) AS off_ms,round(on_ms::numeric,3) AS on_ms,
        round(off_p95::numeric,3) AS off_p95_ms,round(on_p95::numeric,3) AS on_p95_ms,
@@ -1525,11 +1726,35 @@ SELECT case_id,screened_switch,measured_switch,
        round(total_delta_ms::numeric,3) AS plan_plus_exec_delta_ms,assessment
 FROM ua_comp_result ORDER BY delta_ms DESC,case_id;
 
--- Always expose the two worst single-row cases and the previously omitted
--- four-row/free-order cases, even if they become unchanged or improve.
+\echo === 0013 executed coverage: every planned switch must be represented ===
+SELECT p.case_label,count(*) AS cases_screened,
+       count(*) FILTER(WHERE p.plan_changed) AS switches_screened,
+       count(*) FILTER(WHERE r.case_id IS NOT NULL) AS cases_executed,
+       count(*) FILTER(WHERE p.plan_changed AND r.case_id IS NULL) AS switches_not_executed,
+       count(*) FILTER(WHERE r.assessment LIKE 'REVIEW:%') AS review_cases
+FROM ua_comp_pairs p LEFT JOIN ua_comp_result r USING(case_id)
+GROUP BY p.case_label ORDER BY p.case_label;
+
+\echo === 0013 added boundaries: estimates and execution (no accuracy threshold) ===
+SELECT p.case_id,p.case_label,p.collapse_limit,p.work_mem_setting,
+       p.off_rows,p.on_rows,p.expected_rows,
+       round(greatest(greatest(p.off_rows,1)/greatest(p.expected_rows,1),
+                      greatest(p.expected_rows,1)/greatest(p.off_rows,1)),2) AS off_q_error_floor1,
+       round(greatest(greatest(p.on_rows,1)/greatest(p.expected_rows,1),
+                      greatest(p.expected_rows,1)/greatest(p.on_rows,1)),2) AS on_q_error_floor1,
+       r.measured_switch,round(r.delta_pct::numeric,1) AS delta_pct,r.assessment
+FROM ua_comp_pairs p JOIN ua_comp_result r USING(case_id)
+WHERE p.case_id>120 ORDER BY p.case_id;
+
+-- Always retain 40/41 and representative filter cases 127/147; show four REVIEW
+-- or changed-plan effects. Every case remains in the timing summary above.
 CREATE TEMP TABLE ua_comp_details AS
-SELECT case_id FROM ua_comp_result WHERE case_id IN (7,10,40,41);
-\echo === 0011 pinned plan details: cases 7/10/40/41, sample 1 ===
+SELECT case_id FROM ua_comp_result WHERE case_id IN (40,41,127,147)
+UNION
+(SELECT case_id FROM ua_comp_result
+ WHERE case_id NOT IN (40,41,127,147) AND (measured_switch OR assessment LIKE 'REVIEW:%')
+ ORDER BY (assessment LIKE 'REVIEW:%') DESC,abs(delta_ms) DESC,case_id LIMIT 4);
+\echo === 0013 plan details: cases 40/41/127/147 plus up to four candidates, sample 1 ===
 WITH RECURSIVE tree(case_id,mode,node_path,node) AS (
     SELECT s.case_id,s.mode,ARRAY[0]::int[],s.document->0->'Plan'
     FROM ua_comp_samples s JOIN ua_comp_details d USING(case_id) WHERE s.sample_no=1
@@ -1541,22 +1766,228 @@ WITH RECURSIVE tree(case_id,mode,node_path,node) AS (
 SELECT case_id,mode,node_path,node->>'Plan Rows' AS estimated_rows,
        node->>'Actual Rows' AS actual_rows_per_loop,node->>'Actual Loops' AS loops,
        node->>'Total Cost' AS total_cost,node->>'Local Hit Blocks' AS local_hits,
-       node->>'Local Read Blocks' AS local_reads,node->>'Temp Written Blocks' AS temp_writes,
-       node->>'Hash Batches' AS hash_batches,pg_temp.ua_plan_shape(node)-'Plans' AS node_details
+       node->>'Local Read Blocks' AS local_reads,node->>'Temp Read Blocks' AS temp_reads,
+       node->>'Temp Written Blocks' AS temp_writes,node->>'Hash Batches' AS hash_batches,
+       node->>'Sort Space Type' AS sort_space,pg_temp.ua_plan_shape(node)-'Plans' AS node_details
 FROM tree ORDER BY case_id,mode,node_path;
+
+-- 0013: diagnose the accurate-cardinality regressions without changing the
+-- optimizer's costs to favor a particular algorithm. These are independent
+-- experiments AFTER the natural-plan A/B run, not part of its timing summary.
+-- Global enable_* switches can change BOTH joins; they discourage methods,
+-- not guarantee a particular root. Report the chosen tree and outer subtree.
+-- The equivalent LATERAL form constrains the last join to a parameterized
+-- lookup while leaving Hash/Merge available below it. It may introduce Limit,
+-- Subquery Scan or Memoize and is NOT an unchosen path from the original SQL.
+\echo === 0013 targeted diagnostics: cases 67..72, same data/statistics ===
+SELECT name,setting,unit FROM pg_settings WHERE name IN (
+    'seq_page_cost','random_page_cost','cpu_tuple_cost','cpu_index_tuple_cost',
+    'cpu_operator_cost','effective_cache_size','temp_buffers','work_mem',
+    'hash_mem_multiplier','enable_memoize','enable_material','enable_hashjoin',
+    'enable_mergejoin','enable_nestloop','max_parallel_workers_per_gather','jit'
+) ORDER BY name;
+
+CREATE TEMP TABLE ua_diag_variants (
+    variant_no int PRIMARY KEY, variant text UNIQUE,
+    rewritten boolean, hash_on boolean, merge_on boolean, nest_on boolean
+);
+INSERT INTO ua_diag_variants VALUES
+    (1,'natural',false,true,true,true),
+    (2,'nested_only',false,false,false,true),
+    (3,'hash_only',false,true,false,false),
+    (4,'lateral_probe',true,true,true,true);
+CREATE TEMP TABLE ua_diag_queries AS
+SELECT c.case_id,c.expected_rows,c.collapse_limit,c.random_cost,c.work_mem_setting,
+       v.*,m.mode,(v.variant_no-1)*2+m.mode_no AS slot,
+       CASE WHEN v.rewritten THEN format(
+           'SELECT u.id, d.tag, p.v FROM %I u JOIN %I d ON u.k=d.k
+            CROSS JOIN LATERAL (SELECT pp.v FROM %I pp WHERE pp.id=u.id OFFSET 0) p',
+           'ua_comp_u_'||c.hot_rows,'ua_comp_d_'||c.fanout,'ua_comp_p_'||c.probe_rows)
+            ELSE c.query_text END AS query_text
+FROM ua_comp_cases c CROSS JOIN ua_diag_variants v
+CROSS JOIN (VALUES(0,'off'),(1,'on')) m(mode_no,mode)
+WHERE c.case_id BETWEEN 67 AND 72;
+ALTER TABLE ua_diag_queries ADD PRIMARY KEY(case_id,variant,mode);
+CREATE TEMP TABLE ua_diag_correctness (
+    case_id int,variant text,mode text,result_rows bigint,
+    PRIMARY KEY(case_id,variant,mode)
+);
+CREATE TEMP TABLE ua_diag_samples (
+    case_id int,variant text,mode text,sample_no int,
+    execution_ms double precision,planning_ms double precision,document jsonb,
+    PRIMARY KEY(case_id,variant,mode,sample_no)
+);
+CREATE FUNCTION pg_temp.ua_diag_set(p_mode text,p_variant text)
+RETURNS void LANGUAGE plpgsql AS $func$
+DECLARE
+    v ua_diag_variants%ROWTYPE;
+BEGIN
+    SELECT * INTO STRICT v FROM ua_diag_variants WHERE variant=p_variant;
+    PERFORM set_config('enable_union_all_join_estimates',p_mode,true);
+    PERFORM set_config('enable_hashjoin',CASE WHEN v.hash_on THEN 'on' ELSE 'off' END,true);
+    PERFORM set_config('enable_mergejoin',CASE WHEN v.merge_on THEN 'on' ELSE 'off' END,true);
+    PERFORM set_config('enable_nestloop',CASE WHEN v.nest_on THEN 'on' ELSE 'off' END,true);
+END
+$func$;
+
+DO $diagnose$
+DECLARE
+    c record;
+    q record;
+    sample int;
+    doc json;
+    different boolean;
+    actual bigint;
+    old_feature text := current_setting('enable_union_all_join_estimates');
+    old_hash text := current_setting('enable_hashjoin');
+    old_merge text := current_setting('enable_mergejoin');
+    old_nest text := current_setting('enable_nestloop');
+    old_collapse text := current_setting('join_collapse_limit');
+    old_rpc text := current_setting('random_page_cost');
+    old_memory text := current_setting('work_mem');
+BEGIN
+    FOR c IN SELECT * FROM ua_comp_cases WHERE case_id BETWEEN 67 AND 72
+             ORDER BY case_id LOOP
+        PERFORM set_config('join_collapse_limit',c.collapse_limit::text,true);
+        PERFORM set_config('random_page_cost',c.random_cost::text,true);
+        PERFORM set_config('work_mem',c.work_mem_setting,true);
+        PERFORM pg_temp.ua_diag_set('off','natural');
+        EXECUTE 'CREATE TEMP TABLE ua_diag_reference AS '||c.query_text;
+        SELECT count(*) INTO actual FROM ua_diag_reference;
+        IF actual<>c.expected_rows THEN
+            RAISE EXCEPTION '0013 diagnostic reference %: got %, expected %',
+                c.case_id,actual,c.expected_rows;
+        END IF;
+        -- Verify multiplicity, including the rewritten query, before timing.
+        FOR q IN SELECT * FROM ua_diag_queries WHERE case_id=c.case_id ORDER BY slot LOOP
+            PERFORM pg_temp.ua_diag_set(q.mode,q.variant);
+            EXECUTE 'CREATE TEMP TABLE ua_diag_candidate AS '||q.query_text;
+            SELECT count(*) INTO actual FROM ua_diag_candidate;
+            SELECT EXISTS(SELECT 1 FROM (
+                (SELECT * FROM ua_diag_reference EXCEPT ALL SELECT * FROM ua_diag_candidate)
+                UNION ALL
+                (SELECT * FROM ua_diag_candidate EXCEPT ALL SELECT * FROM ua_diag_reference)
+            ) delta) INTO different;
+            IF different OR actual<>q.expected_rows THEN
+                RAISE EXCEPTION '0013 diagnostic bag mismatch: case %, variant %, mode %',
+                    c.case_id,q.variant,q.mode;
+            END IF;
+            INSERT INTO ua_diag_correctness VALUES(c.case_id,q.variant,q.mode,actual);
+            DROP TABLE ua_diag_candidate;
+        END LOOP;
+        DROP TABLE ua_diag_reference;
+        -- Two warmups and eight samples per configuration. Reverse the whole
+        -- eight-configuration order on alternating rounds to reduce order bias.
+        FOR sample IN 1..10 LOOP
+            FOR q IN SELECT * FROM ua_diag_queries WHERE case_id=c.case_id
+                     ORDER BY CASE WHEN sample%2=1 THEN slot ELSE -slot END LOOP
+                PERFORM pg_temp.ua_diag_set(q.mode,q.variant);
+                EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON) '
+                    ||q.query_text INTO doc;
+                IF (doc->0->'Plan'->>'Actual Rows')::numeric<>q.expected_rows OR
+                   (doc->0->'Plan'->>'Actual Loops')::numeric<>1 THEN
+                    RAISE EXCEPTION '0013 diagnostic rows/loops: case %, variant %, mode %',
+                        c.case_id,q.variant,q.mode;
+                END IF;
+                IF sample>2 THEN
+                    INSERT INTO ua_diag_samples VALUES(c.case_id,q.variant,q.mode,sample-2,
+                        (doc->0->>'Execution Time')::double precision,
+                        (doc->0->>'Planning Time')::double precision,doc::jsonb);
+                END IF;
+            END LOOP;
+        END LOOP;
+        RAISE NOTICE '0013 diagnostic case %: 8 configurations, bags PASS, 64 measured samples',c.case_id;
+    END LOOP;
+    PERFORM set_config('enable_union_all_join_estimates',old_feature,true);
+    PERFORM set_config('enable_hashjoin',old_hash,true);
+    PERFORM set_config('enable_mergejoin',old_merge,true);
+    PERFORM set_config('enable_nestloop',old_nest,true);
+    PERFORM set_config('join_collapse_limit',old_collapse,true);
+    PERFORM set_config('random_page_cost',old_rpc,true);
+    PERFORM set_config('work_mem',old_memory,true);
+END
+$diagnose$;
+
+CREATE TEMP VIEW ua_diag_summary AS
+SELECT case_id,variant,mode,count(*) AS samples,
+       percentile_cont(0.5) WITHIN GROUP(ORDER BY execution_ms) AS p50,
+       percentile_cont(0.95) WITHIN GROUP(ORDER BY execution_ms) AS p95,
+       percentile_cont(0.5) WITHIN GROUP(ORDER BY execution_ms+planning_ms) AS total_p50,
+       count(DISTINCT pg_temp.ua_plan_shape(document->0->'Plan')) AS shapes
+FROM ua_diag_samples GROUP BY case_id,variant,mode;
+\echo === 0013 alternatives: costs are model units, timings are milliseconds ===
+\echo === same_outer checks structural shape only; inspect node rows/costs below ===
+SELECT s.case_id,s.mode,s.variant,q.rewritten,q.collapse_limit,q.random_cost,
+       q.work_mem_setting,q.hash_on,q.merge_on,q.nest_on,
+       d.document->0->'Plan'->>'Node Type' AS root_type,
+       d.document->0->'Plan'->>'Plan Rows' AS estimated_rows,
+       d.document->0->'Plan'->>'Total Cost' AS total_cost,
+       pg_temp.ua_plan_shape(d.document->0->'Plan'->'Plans'->0) IS NOT DISTINCT FROM
+       pg_temp.ua_plan_shape(n.document->0->'Plan'->'Plans'->0) AS same_outer_as_natural,
+       round(s.p50::numeric,3) AS p50_ms,round(s.p95::numeric,3) AS p95_ms,
+       round((100*(s.p50/nullif(b.p50,0)-1))::numeric,1) AS pct_vs_same_mode_natural,
+       round((s.total_p50-b.total_p50)::numeric,3) AS total_delta_ms,
+       s.samples,s.shapes
+FROM ua_diag_summary s JOIN ua_diag_queries q USING(case_id,variant,mode)
+JOIN ua_diag_samples d USING(case_id,variant,mode)
+JOIN ua_diag_samples n ON n.case_id=s.case_id AND n.mode=s.mode
+                         AND n.variant='natural' AND n.sample_no=1
+JOIN ua_diag_summary b ON b.case_id=s.case_id AND b.mode=s.mode AND b.variant='natural'
+WHERE d.sample_no=1 ORDER BY s.case_id,s.mode,q.variant_no;
+
+-- These two representatives cover fixed/free order and RPC 1.1/4. All six
+-- have timings above; retain complete trees for these two to bound log size.
+-- Buffer counters include descendants: do not sum them across tree nodes.
+\echo === 0013 diagnostic trees: cases 67/71, all configurations, sample 1 ===
+WITH RECURSIVE tree(case_id,variant,mode,node_path,node) AS (
+    SELECT case_id,variant,mode,ARRAY[0]::int[],document->0->'Plan'
+    FROM ua_diag_samples WHERE case_id IN (67,71) AND sample_no=1
+    UNION ALL
+    SELECT t.case_id,t.variant,t.mode,t.node_path||p.ord::int,p.node
+    FROM tree t CROSS JOIN LATERAL jsonb_array_elements(
+        coalesce(t.node->'Plans','[]'::jsonb)) WITH ORDINALITY p(node,ord)
+)
+SELECT case_id,variant,mode,node_path,node->>'Plan Rows' AS estimated_rows,
+       node->>'Actual Rows' AS actual_rows_per_loop,node->>'Actual Loops' AS loops,
+       node->>'Startup Cost' AS startup_cost,node->>'Total Cost' AS total_cost,
+       node->>'Local Hit Blocks' AS local_hits,node->>'Local Read Blocks' AS local_reads,
+       node->>'Temp Read Blocks' AS temp_reads,node->>'Temp Written Blocks' AS temp_writes,
+       node->>'Hash Batches' AS hash_batches,node->>'Peak Memory Usage' AS peak_memory_kb,
+       node->>'Cache Hits' AS memoize_hits,node->>'Cache Misses' AS memoize_misses,
+       node->>'Cache Evictions' AS memoize_evictions,
+       node->>'Rows Removed by Join Filter' AS removed_by_join_filter,
+       pg_temp.ua_plan_shape(node)-'Plans' AS node_details
+FROM tree ORDER BY case_id,variant,mode,node_path;
+
+DO $diagnostic_complete$
+BEGIN
+    IF (SELECT count(*) FROM ua_diag_queries)<>48 OR
+       (SELECT count(*) FROM ua_diag_correctness)<>48 OR
+       (SELECT count(*) FROM ua_diag_samples)<>384 OR
+       (SELECT count(*) FROM ua_diag_summary)<>48 OR
+       EXISTS(SELECT 1 FROM ua_diag_summary WHERE samples<>8) THEN
+        RAISE EXCEPTION '0013 incomplete targeted diagnostics';
+    END IF;
+    RAISE NOTICE '0013 diagnostic complete: 6 cases, 48 configurations, 384 measured samples. No timing pass/fail assertion.';
+END
+$diagnostic_complete$;
 
 DO $complete$
 DECLARE
     chosen int := (SELECT count(*) FROM ua_comp_selected);
 BEGIN
-    IF chosen<>16 OR
+    IF chosen<54 OR chosen>152 OR
+       EXISTS(SELECT 1 FROM ua_comp_pairs p WHERE
+              (p.plan_changed OR p.case_id>120 OR p.case_id IN (1,2,4,7,8,10,13,14,16,17,19,37,40,41,43,61,67,68,69,70,71,72))
+              AND NOT EXISTS(SELECT 1 FROM ua_comp_selected s WHERE s.case_id=p.case_id)) OR
        (SELECT count(*) FROM ua_comp_correctness WHERE bag_equal)<>chosen OR
        (SELECT count(*) FROM ua_comp_samples)<>chosen*16 OR
        (SELECT count(*) FROM ua_comp_summary)<>chosen*2 OR
+       (SELECT count(*) FROM ua_comp_result)<>chosen OR
        EXISTS(SELECT 1 FROM ua_comp_summary WHERE samples<>8) THEN
-        RAISE EXCEPTION '0011 incomplete execution samples';
+        RAISE EXCEPTION '0013 incomplete execution samples';
     END IF;
-    RAISE NOTICE '0011 complete: % screened, % screened switches, % executed pairs, % measured switches. Unselected cases were NOT executed.',
+    RAISE NOTICE '0013 complete: % screened, % screened switches, % executed pairs, % measured switches. Unselected cases were NOT executed.',
         (SELECT count(*) FROM ua_comp_pairs),
         (SELECT count(*) FROM ua_comp_pairs WHERE plan_changed),chosen,
         (SELECT count(*) FROM ua_comp_result WHERE measured_switch);
