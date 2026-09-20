@@ -1,1314 +1,11386 @@
 \set ON_ERROR_STOP on
-\pset pager off
-
--- Default output is compact.  Run with
---   psql -v topnbench_verbose=true -f contrib/topnbench/benchmark.sql
--- to include every per-case diagnostic row.
-\if :{?topnbench_verbose}
-\else
-\set topnbench_verbose false
-\endif
-\if :topnbench_verbose
-\timing on
-\set QUIET off
-SET client_min_messages = notice;
-SET topnbench.trace = on;
-\else
-\timing off
 \set QUIET on
+\pset pager off
+\pset format unaligned
+\pset tuples_only on
+SET search_path = public;
 SET client_min_messages = warning;
-SET topnbench.trace = off;
-\endif
 
-\echo
-\echo '== Setup =='
-
--- 0011 requires the matching core patch.  Trace only the explicit diagnostic
--- EXPLAINs in regression.sql, never the broad matrix or timed batches.
-SET debug_print_projection_paths = off;
-SET enable_projection_total_cost = on;
-SET trace_sort = off;
-SET debug_disable_sort_radix = off;
-SET debug_projection_placement = auto;
-
+-- First install the updated extension files with make install.
+-- Dedicated test database: reload the same extension version.
 DROP EXTENSION IF EXISTS topnbench;
 CREATE EXTENSION topnbench;
+SELECT topnbench_prepare()
+\gexec
 
-DROP TABLE IF EXISTS topnbench_width_underestimate;
-DROP TABLE IF EXISTS topnbench_width_overestimate;
-DROP TABLE IF EXISTS topnbench_data;
-CREATE UNLOGGED TABLE topnbench_data
-(
-    a integer NOT NULL,
-    a_desc integer NOT NULL,
-    a_random integer NOT NULL,
-    same1 integer NOT NULL,
-    same2 integer NOT NULL,
-    inverse integer NOT NULL
-);
-INSERT INTO topnbench_data
-SELECT g,
-       1000001 - g,
-       ((g::bigint * 48271) % 1000003)::integer,
-       g,
-       g,
-       1000001 - g
-FROM generate_series(1, 1000000) AS g;
-ALTER TABLE topnbench_data SET (parallel_workers = 2);
-ANALYZE topnbench_data;
+-- CLIENT file, relative to psql's working directory. Errors stay on stderr.
+\o topnbench-plans.log
+SELECT topnbench_capture_begin(1028);
 
-\echo
-\echo '== Generated quick matrix: upstream policy versus POC =='
+-- Copy any SET + EXPLAIN below into psql to investigate it manually.
+-- The capture call is only needed when recording a sample for the report.
+-- Plan-only guards omit ANALYZE; timed queries use TIMING OFF.
 
--- Reuse the quick matrix's memory budget in the focused paired rerun.
-SELECT current_setting('work_mem') AS topnbench_quick_work_mem \gset
+-- case: quick/limit-0.0001pct
+-- check: equivalent
+SET standard_conforming_strings = on;
+SET search_path = public;
+SET max_parallel_workers = 2;
+SET max_parallel_workers_per_gather = 0;
+SET parallel_leader_participation = on;
+SET min_parallel_table_scan_size = 0;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET synchronize_seqscans = off;
+SET jit = off;
+SET enable_cost_based_delayed_projection = on;
+SET enable_sort_tuple_width_cost = on;
+SET enable_sort_datum_cost = on;
+SET enable_projection_total_cost = on;
+SET debug_disable_sort_radix = off;
+SET debug_projection_placement = auto;
+SET debug_print_projection_paths = off;
+SET trace_sort = off;
+SET client_min_messages = warning;
+SET work_mem = '4MB';
+SET cursor_tuple_fraction = 0.1;
 
--- Measure the three execution strategies once, under the full POC.  The
--- master and path-only passes below use plain EXPLAIN: they contribute only
--- planner choices, so neither cache order nor CPU-frequency drift can change
--- the observed winner.
+-- variant: upstream-auto
+-- sample: plan
 SET enable_cost_based_delayed_projection = off;
 SET enable_sort_tuple_width_cost = off;
-DROP TABLE IF EXISTS topnbench_master_results;
-CREATE TEMP TABLE topnbench_master_results AS
-SELECT *
-FROM topnbench_run('topnbench_data', 'a_random', 5, 'quick', false, true);
+SELECT topnbench_capture('quick/limit-0.0001pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 1;
 
--- Isolate the delayed-projection path construction from the new Sort cost.
+-- variant: path-only-auto
+-- sample: plan
 SET enable_cost_based_delayed_projection = on;
-SET enable_sort_tuple_width_cost = off;
-DROP TABLE IF EXISTS topnbench_path_only_results;
-CREATE TEMP TABLE topnbench_path_only_results AS
-SELECT *
-FROM topnbench_run('topnbench_data', 'a_random', 5, 'quick', false, true);
+SELECT topnbench_capture('quick/limit-0.0001pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 1;
 
+-- variant: auto
+-- sample: timed
 SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/limit-0.0001pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 1;
 
--- Materialize the POC run once so that the detail and summary queries below
--- use exactly the same measurements.
-DROP TABLE IF EXISTS topnbench_results;
-CREATE TEMP TABLE topnbench_results AS
-SELECT *
-FROM topnbench_run('topnbench_data', 'a_random', 5, 'quick', true);
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/limit-0.0001pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 1) AS s
+LIMIT 1;
 
-\if :topnbench_verbose
-SELECT case_name,
-       round(selectivity::numeric, 6) AS selectivity,
-       expression_shape,
-       expression_steps,
-       declared_cost,
-       work_rounds,
-       requested_workers AS workers,
-       planner_choice,
-       actual_winner,
-       decision_class,
-       planner_choice_correct AS correct,
-       round(row_estimation_ratio::numeric, 3) AS row_est_error,
-       estimated_sort_width AS est_width,
-       sort_method,
-       sort_space_type,
-       round(sort_space_used_kb::numeric, 0) AS sort_kb,
-       round(auto_median_ms::numeric, 3) AS auto_ms,
-       round(manual_late_median_ms::numeric, 3) AS late_ms,
-       round(forced_early_median_ms::numeric, 3) AS early_ms,
-       round(choice_regression_ratio::numeric, 3) AS regret,
-       cost_model_choice AS cost_model,
-       structural_model_choice AS structural_model
-FROM topnbench_results
-ORDER BY ctid;
-\endif
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/limit-0.0001pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 1;
 
-SELECT count(*) FILTER (WHERE planner_choice_correct) AS planner_correct,
-       count(*) FILTER (WHERE planner_choice_correct = false) AS planner_wrong,
-       count(*) FILTER (WHERE planner_choice_correct IS NULL) AS inconclusive,
-       count(*) FILTER (WHERE decision_class = 'false-late') AS false_late,
-       count(*) FILTER (WHERE decision_class = 'false-early') AS false_early,
-       round(max(choice_regression_ratio)::numeric, 3) AS worst_regret,
-       round((percentile_cont(0.95) WITHIN GROUP
-              (ORDER BY choice_regression_ratio))::numeric, 3) AS p95_regret,
-       count(*) FILTER (WHERE cost_model_correct) AS cost_model_correct,
-       count(*) FILTER (WHERE cost_model_correct = false) AS cost_model_wrong,
-       count(*) FILTER (WHERE structural_model_correct) AS structural_correct,
-       count(*) FILTER (WHERE structural_model_correct = false) AS structural_wrong
-FROM topnbench_results;
+-- case: quick/limit-0.01pct
+-- check: equivalent
 
--- Compare each policy's plan-only decision against the winner measured once
--- by the patched run.
-DROP TABLE IF EXISTS topnbench_choice_comparison;
-CREATE TEMP TABLE topnbench_choice_comparison AS
-WITH paired AS
-(
-    SELECT p.case_name,
-           m.planner_choice AS master_choice,
-           o.planner_choice AS path_only_choice,
-           p.planner_choice AS patched_choice,
-           p.actual_winner AS patched_actual_winner,
-           CASE m.planner_choice
-               WHEN 'late' THEN p.manual_late_median_ms
-               WHEN 'early' THEN p.forced_early_median_ms
-           END AS master_strategy_ms,
-           CASE p.planner_choice
-               WHEN 'late' THEN p.manual_late_median_ms
-               WHEN 'early' THEN p.forced_early_median_ms
-           END AS patched_strategy_ms,
-           CASE o.planner_choice
-               WHEN 'late' THEN p.manual_late_median_ms
-               WHEN 'early' THEN p.forced_early_median_ms
-           END AS path_only_strategy_ms
-    FROM topnbench_results AS p
-    JOIN topnbench_master_results AS m USING (case_name)
-    JOIN topnbench_path_only_results AS o USING (case_name)
-), classified AS
-(
-    SELECT paired.*,
-           CASE
-               WHEN master_choice IS NULL OR patched_choice IS NULL OR
-                    master_choice = 'unknown' OR
-                    patched_choice = 'unknown' OR
-                    patched_actual_winner = 'tie'
-                   THEN 'inconclusive'
-               WHEN master_choice = patched_choice AND
-                    patched_choice = patched_actual_winner
-                   THEN 'unchanged-correct'
-               WHEN master_choice = patched_choice
-                   THEN 'unchanged-miss'
-               WHEN patched_choice = patched_actual_winner
-                   THEN 'improvement'
-               WHEN master_choice = patched_actual_winner
-                   THEN 'regression'
-               ELSE 'inconclusive'
-           END AS patch_effect,
-           CASE
-               WHEN master_choice IS NULL OR path_only_choice IS NULL OR
-                    master_choice = 'unknown' OR
-                    path_only_choice = 'unknown' OR
-                    patched_actual_winner = 'tie'
-                   THEN 'inconclusive'
-               WHEN master_choice = path_only_choice AND
-                    path_only_choice = patched_actual_winner
-                   THEN 'unchanged-correct'
-               WHEN master_choice = path_only_choice
-                   THEN 'unchanged-miss'
-               WHEN path_only_choice = patched_actual_winner
-                   THEN 'improvement'
-               WHEN master_choice = patched_actual_winner
-                   THEN 'regression'
-               ELSE 'inconclusive'
-           END AS path_only_effect,
-           CASE
-               WHEN path_only_choice IS NULL OR patched_choice IS NULL OR
-                    path_only_choice = 'unknown' OR
-                    patched_choice = 'unknown' OR
-                    patched_actual_winner = 'tie'
-                   THEN 'inconclusive'
-               WHEN path_only_choice = patched_choice AND
-                    patched_choice = patched_actual_winner
-                   THEN 'unchanged-correct'
-               WHEN path_only_choice = patched_choice
-                   THEN 'unchanged-miss'
-               WHEN patched_choice = patched_actual_winner
-                   THEN 'improvement'
-               WHEN path_only_choice = patched_actual_winner
-                   THEN 'regression'
-               ELSE 'inconclusive'
-           END AS width_cost_effect
-    FROM paired
-)
-SELECT classified.*,
-       master_strategy_ms / NULLIF(patched_strategy_ms, 0) AS
-           patch_vs_master_speedup,
-       path_only_strategy_ms / NULLIF(patched_strategy_ms, 0) AS
-           width_cost_vs_path_only_speedup
-FROM classified;
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/limit-0.01pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100;
 
-\if :topnbench_verbose
-SELECT case_name,
-       master_choice,
-       path_only_choice,
-       patched_choice,
-       patched_actual_winner AS actual_winner,
-       patch_effect,
-       path_only_effect,
-       width_cost_effect,
-       round(master_strategy_ms::numeric, 3) AS master_strategy_ms,
-       round(patched_strategy_ms::numeric, 3) AS patched_strategy_ms,
-       round(patch_vs_master_speedup::numeric, 3) AS
-           patch_vs_master_speedup
-FROM topnbench_choice_comparison
-ORDER BY case_name;
-\endif
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/limit-0.01pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100;
 
-SELECT count(*) FILTER (WHERE master_choice <> patched_choice) AS
-           changed_choices,
-       count(*) FILTER (WHERE patch_effect = 'improvement') AS improvements,
-       count(*) FILTER (WHERE patch_effect = 'improvement' AND
-                              patched_choice = 'late') AS changed_to_late_wins,
-       count(*) FILTER (WHERE patch_effect = 'improvement' AND
-                              patched_choice = 'early') AS changed_to_early_wins,
-       count(*) FILTER (WHERE patch_effect = 'regression') AS new_regressions,
-       count(*) FILTER (WHERE patch_effect = 'unchanged-miss') AS
-           unchanged_misses,
-       count(*) FILTER (WHERE patch_effect = 'inconclusive') AS inconclusive,
-       count(*) FILTER (WHERE master_choice <> path_only_choice) AS
-           path_only_changes,
-       count(*) FILTER (WHERE path_only_effect = 'improvement') AS
-           path_only_improvements,
-       count(*) FILTER (WHERE path_only_effect = 'regression') AS
-           path_only_regressions,
-       count(*) FILTER (WHERE path_only_choice <> patched_choice) AS
-           width_cost_changes,
-       count(*) FILTER (WHERE width_cost_effect = 'improvement') AS
-           width_cost_improvements,
-       count(*) FILTER (WHERE width_cost_effect = 'regression') AS
-           width_cost_regressions,
-       round(max(CASE WHEN patch_effect = 'improvement'
-                      THEN patch_vs_master_speedup END)::numeric, 3) AS
-           best_new_speedup,
-       round(max(CASE WHEN patch_effect = 'regression'
-                      THEN 1.0 / patch_vs_master_speedup END)::numeric, 3) AS
-           worst_new_regret
-FROM topnbench_choice_comparison;
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/limit-0.01pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100;
 
-\echo
-\echo '== Supplemental case catalog =='
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/limit-0.01pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 100) AS s
+LIMIT 100;
 
--- Keep the hand-written cases in one catalog.  A phase identifies the
--- session state under which a case must run; category is only for reporting.
-DROP TABLE IF EXISTS topnbench_case_definitions;
-CREATE TEMP TABLE topnbench_case_definitions
-(
-    case_order integer PRIMARY KEY,
-    phase text NOT NULL,
-    category text NOT NULL,
-    case_name text NOT NULL UNIQUE,
-    auto_query text NOT NULL,
-    manual_late_query text NOT NULL,
-    forced_early_query text NOT NULL,
-    iterations integer NOT NULL,
-    work_mem_setting text
-);
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/limit-0.01pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 100;
 
--- Representative expressions run with the normal parallel settings.
-INSERT INTO topnbench_case_definitions VALUES
-    (100, 'parallel-expressions', 'real-expressions', 'numeric-example',
-     $q$SELECT a,
+-- case: quick/limit-1pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/limit-1pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 10000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/limit-1pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 10000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/limit-1pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 10000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/limit-1pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 10000) AS s
+LIMIT 10000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/limit-1pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 10000;
+
+-- case: quick/limit-10pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/limit-10pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/limit-10pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/limit-10pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/limit-10pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 100000) AS s
+LIMIT 100000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/limit-10pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 100000;
+
+-- case: quick/limit-20pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/limit-20pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 200000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/limit-20pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 200000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/limit-20pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 200000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/limit-20pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 200000) AS s
+LIMIT 200000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/limit-20pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 200000;
+
+-- case: quick/limit-30pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/limit-30pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 300000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/limit-30pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 300000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/limit-30pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 300000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/limit-30pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 300000) AS s
+LIMIT 300000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/limit-30pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 300000;
+
+-- case: quick/limit-40pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/limit-40pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 400000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/limit-40pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 400000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/limit-40pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 400000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/limit-40pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 400000) AS s
+LIMIT 400000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/limit-40pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 400000;
+
+-- case: quick/limit-50pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/limit-50pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 500000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/limit-50pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 500000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/limit-50pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 500000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/limit-50pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 500000) AS s
+LIMIT 500000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/limit-50pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 500000;
+
+-- case: quick/limit-60pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/limit-60pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 600000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/limit-60pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 600000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/limit-60pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 600000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/limit-60pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 600000) AS s
+LIMIT 600000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/limit-60pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 600000;
+
+-- case: quick/limit-70pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/limit-70pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 700000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/limit-70pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 700000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/limit-70pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 700000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/limit-70pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 700000) AS s
+LIMIT 700000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/limit-70pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 700000;
+
+-- case: quick/limit-80pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/limit-80pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 800000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/limit-80pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 800000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/limit-80pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 800000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/limit-80pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 800000) AS s
+LIMIT 800000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/limit-80pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 800000;
+
+-- case: quick/limit-90pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/limit-90pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/limit-90pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/limit-90pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/limit-90pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 900000) AS s
+LIMIT 900000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/limit-90pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 900000;
+
+-- case: quick/limit-100pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/limit-100pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 1000000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/limit-100pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 1000000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/limit-100pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 1000000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/limit-100pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 1000000) AS s
+LIMIT 1000000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/limit-100pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 1000000;
+
+-- case: quick/steps-1
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/steps-1', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/steps-1', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/steps-1', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/steps-1', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 100000) AS s
+LIMIT 100000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/steps-1', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 100000;
+
+-- case: quick/steps-2
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/steps-2', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/steps-2', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/steps-2', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/steps-2', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 100000) AS s
+LIMIT 100000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/steps-2', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2
+FROM topnbench_data
+ORDER BY a_random, e1, e2
+LIMIT 100000;
+
+-- case: quick/steps-8
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/steps-8', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4,
+       topnbench_work_cost_1(a_random, 4, 5) AS e5,
+       topnbench_work_cost_1(a_random, 4, 6) AS e6,
+       topnbench_work_cost_1(a_random, 4, 7) AS e7,
+       topnbench_work_cost_1(a_random, 4, 8) AS e8
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/steps-8', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4,
+       topnbench_work_cost_1(a_random, 4, 5) AS e5,
+       topnbench_work_cost_1(a_random, 4, 6) AS e6,
+       topnbench_work_cost_1(a_random, 4, 7) AS e7,
+       topnbench_work_cost_1(a_random, 4, 8) AS e8
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/steps-8', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4,
+       topnbench_work_cost_1(a_random, 4, 5) AS e5,
+       topnbench_work_cost_1(a_random, 4, 6) AS e6,
+       topnbench_work_cost_1(a_random, 4, 7) AS e7,
+       topnbench_work_cost_1(a_random, 4, 8) AS e8
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/steps-8', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4,
+       topnbench_work_cost_1(s.k, 4, 5) AS e5,
+       topnbench_work_cost_1(s.k, 4, 6) AS e6,
+       topnbench_work_cost_1(s.k, 4, 7) AS e7,
+       topnbench_work_cost_1(s.k, 4, 8) AS e8
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 100000) AS s
+LIMIT 100000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/steps-8', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4,
+       topnbench_work_cost_1(a_random, 4, 5) AS e5,
+       topnbench_work_cost_1(a_random, 4, 6) AS e6,
+       topnbench_work_cost_1(a_random, 4, 7) AS e7,
+       topnbench_work_cost_1(a_random, 4, 8) AS e8
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4, e5, e6, e7, e8
+LIMIT 100000;
+
+-- case: quick/steps-16
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/steps-16', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4,
+       topnbench_work_cost_1(a_random, 4, 5) AS e5,
+       topnbench_work_cost_1(a_random, 4, 6) AS e6,
+       topnbench_work_cost_1(a_random, 4, 7) AS e7,
+       topnbench_work_cost_1(a_random, 4, 8) AS e8,
+       topnbench_work_cost_1(a_random, 4, 9) AS e9,
+       topnbench_work_cost_1(a_random, 4, 10) AS e10,
+       topnbench_work_cost_1(a_random, 4, 11) AS e11,
+       topnbench_work_cost_1(a_random, 4, 12) AS e12,
+       topnbench_work_cost_1(a_random, 4, 13) AS e13,
+       topnbench_work_cost_1(a_random, 4, 14) AS e14,
+       topnbench_work_cost_1(a_random, 4, 15) AS e15,
+       topnbench_work_cost_1(a_random, 4, 16) AS e16
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/steps-16', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4,
+       topnbench_work_cost_1(a_random, 4, 5) AS e5,
+       topnbench_work_cost_1(a_random, 4, 6) AS e6,
+       topnbench_work_cost_1(a_random, 4, 7) AS e7,
+       topnbench_work_cost_1(a_random, 4, 8) AS e8,
+       topnbench_work_cost_1(a_random, 4, 9) AS e9,
+       topnbench_work_cost_1(a_random, 4, 10) AS e10,
+       topnbench_work_cost_1(a_random, 4, 11) AS e11,
+       topnbench_work_cost_1(a_random, 4, 12) AS e12,
+       topnbench_work_cost_1(a_random, 4, 13) AS e13,
+       topnbench_work_cost_1(a_random, 4, 14) AS e14,
+       topnbench_work_cost_1(a_random, 4, 15) AS e15,
+       topnbench_work_cost_1(a_random, 4, 16) AS e16
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/steps-16', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4,
+       topnbench_work_cost_1(a_random, 4, 5) AS e5,
+       topnbench_work_cost_1(a_random, 4, 6) AS e6,
+       topnbench_work_cost_1(a_random, 4, 7) AS e7,
+       topnbench_work_cost_1(a_random, 4, 8) AS e8,
+       topnbench_work_cost_1(a_random, 4, 9) AS e9,
+       topnbench_work_cost_1(a_random, 4, 10) AS e10,
+       topnbench_work_cost_1(a_random, 4, 11) AS e11,
+       topnbench_work_cost_1(a_random, 4, 12) AS e12,
+       topnbench_work_cost_1(a_random, 4, 13) AS e13,
+       topnbench_work_cost_1(a_random, 4, 14) AS e14,
+       topnbench_work_cost_1(a_random, 4, 15) AS e15,
+       topnbench_work_cost_1(a_random, 4, 16) AS e16
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/steps-16', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4,
+       topnbench_work_cost_1(s.k, 4, 5) AS e5,
+       topnbench_work_cost_1(s.k, 4, 6) AS e6,
+       topnbench_work_cost_1(s.k, 4, 7) AS e7,
+       topnbench_work_cost_1(s.k, 4, 8) AS e8,
+       topnbench_work_cost_1(s.k, 4, 9) AS e9,
+       topnbench_work_cost_1(s.k, 4, 10) AS e10,
+       topnbench_work_cost_1(s.k, 4, 11) AS e11,
+       topnbench_work_cost_1(s.k, 4, 12) AS e12,
+       topnbench_work_cost_1(s.k, 4, 13) AS e13,
+       topnbench_work_cost_1(s.k, 4, 14) AS e14,
+       topnbench_work_cost_1(s.k, 4, 15) AS e15,
+       topnbench_work_cost_1(s.k, 4, 16) AS e16
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 100000) AS s
+LIMIT 100000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/steps-16', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4,
+       topnbench_work_cost_1(a_random, 4, 5) AS e5,
+       topnbench_work_cost_1(a_random, 4, 6) AS e6,
+       topnbench_work_cost_1(a_random, 4, 7) AS e7,
+       topnbench_work_cost_1(a_random, 4, 8) AS e8,
+       topnbench_work_cost_1(a_random, 4, 9) AS e9,
+       topnbench_work_cost_1(a_random, 4, 10) AS e10,
+       topnbench_work_cost_1(a_random, 4, 11) AS e11,
+       topnbench_work_cost_1(a_random, 4, 12) AS e12,
+       topnbench_work_cost_1(a_random, 4, 13) AS e13,
+       topnbench_work_cost_1(a_random, 4, 14) AS e14,
+       topnbench_work_cost_1(a_random, 4, 15) AS e15,
+       topnbench_work_cost_1(a_random, 4, 16) AS e16
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16
+LIMIT 100000;
+
+-- case: quick/cost-1-work-1
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/cost-1-work-1', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/cost-1-work-1', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/cost-1-work-1', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/cost-1-work-1', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 1, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/cost-1-work-1', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: quick/cost-1-work-16
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/cost-1-work-16', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/cost-1-work-16', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/cost-1-work-16', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/cost-1-work-16', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/cost-1-work-16', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: quick/cost-1-work-64
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/cost-1-work-64', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/cost-1-work-64', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/cost-1-work-64', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/cost-1-work-64', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 64, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/cost-1-work-64', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: quick/cost-10-work-1
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/cost-10-work-1', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_10(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/cost-10-work-1', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_10(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/cost-10-work-1', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_10(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/cost-10-work-1', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_10(s.k, 1, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/cost-10-work-1', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_10(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: quick/cost-10-work-16
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/cost-10-work-16', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_10(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/cost-10-work-16', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_10(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/cost-10-work-16', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_10(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/cost-10-work-16', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_10(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/cost-10-work-16', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_10(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: quick/cost-10-work-64
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/cost-10-work-64', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_10(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/cost-10-work-64', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_10(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/cost-10-work-64', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_10(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/cost-10-work-64', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_10(s.k, 64, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/cost-10-work-64', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_10(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: quick/cost-100-work-1
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/cost-100-work-1', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_100(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/cost-100-work-1', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_100(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/cost-100-work-1', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_100(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/cost-100-work-1', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_100(s.k, 1, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/cost-100-work-1', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_100(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: quick/cost-100-work-16
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/cost-100-work-16', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_100(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/cost-100-work-16', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_100(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/cost-100-work-16', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_100(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/cost-100-work-16', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_100(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/cost-100-work-16', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_100(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: quick/cost-100-work-64
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/cost-100-work-64', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_100(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/cost-100-work-64', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_100(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/cost-100-work-64', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_100(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/cost-100-work-64', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_100(s.k, 64, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/cost-100-work-64', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_100(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: quick/nested-1
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/nested-1', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/nested-1', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/nested-1', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/nested-1', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 100000) AS s
+LIMIT 100000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/nested-1', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 100000;
+
+-- case: quick/nested-2
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/nested-2', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(topnbench_work_cost_1(a_random, 4, 2), 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/nested-2', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(topnbench_work_cost_1(a_random, 4, 2), 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/nested-2', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(topnbench_work_cost_1(a_random, 4, 2), 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/nested-2', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(topnbench_work_cost_1(s.k, 4, 2), 4, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 100000) AS s
+LIMIT 100000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/nested-2', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(topnbench_work_cost_1(a_random, 4, 2), 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 100000;
+
+-- case: quick/nested-4
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/nested-4', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(a_random, 4, 4), 4, 3), 4, 2), 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/nested-4', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(a_random, 4, 4), 4, 3), 4, 2), 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/nested-4', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(a_random, 4, 4), 4, 3), 4, 2), 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/nested-4', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(s.k, 4, 4), 4, 3), 4, 2), 4, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 100000) AS s
+LIMIT 100000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/nested-4', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(a_random, 4, 4), 4, 3), 4, 2), 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 100000;
+
+-- case: quick/nested-8
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/nested-8', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(a_random, 4, 8), 4, 7), 4, 6), 4, 5), 4, 4), 4, 3), 4, 2), 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/nested-8', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(a_random, 4, 8), 4, 7), 4, 6), 4, 5), 4, 4), 4, 3), 4, 2), 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/nested-8', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(a_random, 4, 8), 4, 7), 4, 6), 4, 5), 4, 4), 4, 3), 4, 2), 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/nested-8', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(s.k, 4, 8), 4, 7), 4, 6), 4, 5), 4, 4), 4, 3), 4, 2), 4, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 100000) AS s
+LIMIT 100000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/nested-8', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(a_random, 4, 8), 4, 7), 4, 6), 4, 5), 4, 4), 4, 3), 4, 2), 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 100000;
+
+-- case: quick/nested-16
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/nested-16', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(a_random, 4, 16), 4, 15), 4, 14), 4, 13), 4, 12), 4, 11), 4, 10), 4, 9), 4, 8), 4, 7), 4, 6), 4, 5), 4, 4), 4, 3), 4, 2), 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/nested-16', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(a_random, 4, 16), 4, 15), 4, 14), 4, 13), 4, 12), 4, 11), 4, 10), 4, 9), 4, 8), 4, 7), 4, 6), 4, 5), 4, 4), 4, 3), 4, 2), 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/nested-16', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(a_random, 4, 16), 4, 15), 4, 14), 4, 13), 4, 12), 4, 11), 4, 10), 4, 9), 4, 8), 4, 7), 4, 6), 4, 5), 4, 4), 4, 3), 4, 2), 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 100000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/nested-16', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(s.k, 4, 16), 4, 15), 4, 14), 4, 13), 4, 12), 4, 11), 4, 10), 4, 9), 4, 8), 4, 7), 4, 6), 4, 5), 4, 4), 4, 3), 4, 2), 4, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 100000) AS s
+LIMIT 100000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/nested-16', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(topnbench_work_cost_1(a_random, 4, 16), 4, 15), 4, 14), 4, 13), 4, 12), 4, 11), 4, 10), 4, 9), 4, 8), 4, 7), 4, 6), 4, 5), 4, 4), 4, 3), 4, 2), 4, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 100000;
+
+-- case: quick/parallel-limit-1
+-- check: equivalent
+SET max_parallel_workers_per_gather = 2;
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/parallel-limit-1', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 1;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/parallel-limit-1', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 1;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/parallel-limit-1', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 1;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/parallel-limit-1', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 1) AS s
+LIMIT 1;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/parallel-limit-1', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 1;
+
+-- case: quick/parallel-limit-1pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/parallel-limit-1pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 10000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/parallel-limit-1pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 10000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/parallel-limit-1pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 10000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/parallel-limit-1pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 10000) AS s
+LIMIT 10000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/parallel-limit-1pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 10000;
+
+-- case: quick/parallel-limit-25pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/parallel-limit-25pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/parallel-limit-25pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/parallel-limit-25pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/parallel-limit-25pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/parallel-limit-25pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 250000;
+
+-- case: quick/parallel-limit-50pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/parallel-limit-50pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 500000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/parallel-limit-50pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 500000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/parallel-limit-50pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 500000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/parallel-limit-50pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 500000) AS s
+LIMIT 500000;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/parallel-limit-50pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 500000;
+
+-- case: quick/offset-10pct-limit-1
+-- check: equivalent
+SET max_parallel_workers_per_gather = 0;
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/offset-10pct-limit-1', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+OFFSET 100000
+LIMIT 1;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/offset-10pct-limit-1', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+OFFSET 100000
+LIMIT 1;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/offset-10pct-limit-1', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+OFFSET 100000
+LIMIT 1;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/offset-10pct-limit-1', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 100001) AS s
+OFFSET 100000
+LIMIT 1;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/offset-10pct-limit-1', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+OFFSET 100000
+LIMIT 1;
+
+-- case: quick/offset-25pct-limit-1
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('quick/offset-25pct-limit-1', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+OFFSET 250000
+LIMIT 1;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('quick/offset-25pct-limit-1', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+OFFSET 250000
+LIMIT 1;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('quick/offset-25pct-limit-1', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+OFFSET 250000
+LIMIT 1;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('quick/offset-25pct-limit-1', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250001) AS s
+OFFSET 250000
+LIMIT 1;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('quick/offset-25pct-limit-1', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+OFFSET 250000
+LIMIT 1;
+
+-- case: expressions/numeric-example
+-- check: equivalent
+SET max_parallel_workers_per_gather = 2;
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('expressions/numeric-example', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a,
                a / (a * -1),
                a::numeric AS b,
                abs(a::numeric) / 12345.345632
-        FROM topnbench_data ORDER BY a LIMIT 1$q$,
-     $q$SELECT s.a,
+        FROM topnbench_data ORDER BY a LIMIT 1;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('expressions/numeric-example', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a,
+               a / (a * -1),
+               a::numeric AS b,
+               abs(a::numeric) / 12345.345632
+        FROM topnbench_data ORDER BY a LIMIT 1;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('expressions/numeric-example', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a,
+               a / (a * -1),
+               a::numeric AS b,
+               abs(a::numeric) / 12345.345632
+        FROM topnbench_data ORDER BY a LIMIT 1;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('expressions/numeric-example', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.a,
                s.a / (s.a * -1),
                s.a::numeric AS b,
                abs(s.a::numeric) / 12345.345632
-        FROM (SELECT a FROM topnbench_data ORDER BY a LIMIT 1) AS s$q$,
-     $q$SELECT a,
+        FROM (SELECT a FROM topnbench_data ORDER BY a LIMIT 1) AS s;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('expressions/numeric-example', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a,
                a / (a * -1) AS e2,
                a::numeric AS b,
                abs(a::numeric) / 12345.345632 AS e4
-        FROM topnbench_data ORDER BY a, e2, b, e4 LIMIT 1$q$,
-     7, NULL),
-    (110, 'parallel-expressions', 'real-expressions', 'cheap-builtins',
-     $q$SELECT a, a + 1 AS e1, a * 3 AS e2,
-               abs(a - 500000) AS e3
-        FROM topnbench_data ORDER BY a LIMIT 250000$q$,
-     $q$SELECT s.a, s.a + 1 AS e1, s.a * 3 AS e2,
-               abs(s.a - 500000) AS e3
-        FROM (SELECT a FROM topnbench_data
-              ORDER BY a LIMIT 250000) AS s$q$,
-     $q$SELECT a, a + 1 AS e1, a * 3 AS e2,
-               abs(a - 500000) AS e3
-        FROM topnbench_data ORDER BY a, e1, e2, e3 LIMIT 250000$q$,
-     7, NULL),
-    (120, 'parallel-expressions', 'real-expressions', 'text-producing',
-     $q$SELECT a, a::text AS e1, md5(a::text) AS e2
-        FROM topnbench_data ORDER BY a LIMIT 10000$q$,
-     $q$SELECT s.a, s.a::text AS e1, md5(s.a::text) AS e2
-        FROM (SELECT a FROM topnbench_data
-              ORDER BY a LIMIT 10000) AS s$q$,
-     $q$SELECT a, a::text AS e1, md5(a::text) AS e2
-        FROM topnbench_data ORDER BY a, e1, e2 LIMIT 10000$q$,
-     7, NULL);
+        FROM topnbench_data ORDER BY a, e2, b, e4 LIMIT 1;
 
--- Use topnbench_compare()'s declared row type as the result-table schema.
--- WITH NO DATA guarantees that creating the table performs no benchmark run.
-DROP TABLE IF EXISTS topnbench_supplemental_results;
-CREATE TEMP TABLE topnbench_supplemental_results AS
-SELECT 'master'::text AS policy,
-       d.case_order,
-       d.phase,
-       d.category,
-       d.case_name,
-       c.*
-FROM topnbench_case_definitions AS d
-CROSS JOIN LATERAL topnbench_compare(
-    d.auto_query,
-    d.manual_late_query,
-    d.forced_early_query,
-    d.iterations,
-    true,
-    d.work_mem_setting,
-    false) AS c
-WITH NO DATA;
+-- case: expressions/cheap-builtins
+-- check: equivalent
 
--- Targeted diagnostics reuse this schema and the exact catalog queries.
-\ir regression.sql
-
-\echo
-\echo '== Supplemental phase: representative expressions =='
-
+-- variant: upstream-auto
+-- sample: plan
 SET enable_cost_based_delayed_projection = off;
 SET enable_sort_tuple_width_cost = off;
-INSERT INTO topnbench_supplemental_results
-SELECT 'master', d.case_order, d.phase, d.category, d.case_name, c.*
-FROM topnbench_case_definitions AS d
-CROSS JOIN LATERAL topnbench_compare(
-    d.auto_query, d.manual_late_query, d.forced_early_query,
-    d.iterations, false, d.work_mem_setting, true) AS c
-WHERE d.phase = 'parallel-expressions'
-ORDER BY d.case_order;
+SELECT topnbench_capture('expressions/cheap-builtins', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a, a + 1 AS e1, a * 3 AS e2,
+               abs(a - 500000) AS e3
+        FROM topnbench_data ORDER BY a LIMIT 250000;
 
+-- variant: path-only-auto
+-- sample: plan
 SET enable_cost_based_delayed_projection = on;
-INSERT INTO topnbench_supplemental_results
-SELECT 'path-only', d.case_order, d.phase, d.category, d.case_name, c.*
-FROM topnbench_case_definitions AS d
-CROSS JOIN LATERAL topnbench_compare(
-    d.auto_query, d.manual_late_query, d.forced_early_query,
-    d.iterations, false, d.work_mem_setting, true) AS c
-WHERE d.phase = 'parallel-expressions'
-ORDER BY d.case_order;
+SELECT topnbench_capture('expressions/cheap-builtins', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a, a + 1 AS e1, a * 3 AS e2,
+               abs(a - 500000) AS e3
+        FROM topnbench_data ORDER BY a LIMIT 250000;
 
+-- variant: auto
+-- sample: timed
 SET enable_sort_tuple_width_cost = on;
-INSERT INTO topnbench_supplemental_results
-SELECT 'patched', d.case_order, d.phase, d.category, d.case_name, c.*
-FROM topnbench_case_definitions AS d
-CROSS JOIN LATERAL topnbench_compare(
-    d.auto_query, d.manual_late_query, d.forced_early_query,
-    d.iterations, true, d.work_mem_setting, false) AS c
-WHERE d.phase = 'parallel-expressions'
-ORDER BY d.case_order;
+SELECT topnbench_capture('expressions/cheap-builtins', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a, a + 1 AS e1, a * 3 AS e2,
+               abs(a - 500000) AS e3
+        FROM topnbench_data ORDER BY a LIMIT 250000;
 
-\echo
-\echo '== Supplemental setup: adversarial estimates and Sort behavior =='
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('expressions/cheap-builtins', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.a, s.a + 1 AS e1, s.a * 3 AS e2,
+               abs(s.a - 500000) AS e3
+        FROM (SELECT a FROM topnbench_data
+              ORDER BY a LIMIT 250000) AS s;
 
--- Robustness tests are serial so row estimates and Sort-space measurements
--- are easier to interpret.  They are targeted cases, not a Cartesian product.
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('expressions/cheap-builtins', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a, a + 1 AS e1, a * 3 AS e2,
+               abs(a - 500000) AS e3
+        FROM topnbench_data ORDER BY a, e1, e2, e3 LIMIT 250000;
+
+-- case: expressions/text-producing
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('expressions/text-producing', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a, a::text AS e1, md5(a::text) AS e2
+        FROM topnbench_data ORDER BY a LIMIT 10000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('expressions/text-producing', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a, a::text AS e1, md5(a::text) AS e2
+        FROM topnbench_data ORDER BY a LIMIT 10000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('expressions/text-producing', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a, a::text AS e1, md5(a::text) AS e2
+        FROM topnbench_data ORDER BY a LIMIT 10000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('expressions/text-producing', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.a, s.a::text AS e1, md5(s.a::text) AS e2
+        FROM (SELECT a FROM topnbench_data
+              ORDER BY a LIMIT 10000) AS s;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('expressions/text-producing', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a, a::text AS e1, md5(a::text) AS e2
+        FROM topnbench_data ORDER BY a, e1, e2 LIMIT 10000;
+
+-- case: estimates/rows-underestimated
+-- check: equivalent
 SET max_parallel_workers_per_gather = 0;
 SET work_mem = '256MB';
 
--- Physical input order changes real Sort work without changing planner inputs.
-INSERT INTO topnbench_case_definitions
-SELECT 200 + q.case_offset,
-       'serial-stale',
-       'physical-input-order',
-       q.case_name,
-       format(
-           'SELECT %1$I AS k, topnbench_work_cost_1(%1$I, 16, 1) AS e1 '
-           'FROM topnbench_data ORDER BY %1$I LIMIT 250000',
-           q.key_column),
-       format(
-           'SELECT s.k, topnbench_work_cost_1(s.k, 16, 1) AS e1 '
-           'FROM (SELECT %1$I AS k FROM topnbench_data '
-           'ORDER BY %1$I LIMIT 250000) AS s',
-           q.key_column),
-       format(
-           'SELECT %1$I AS k, topnbench_work_cost_1(%1$I, 16, 1) AS e1 '
-           'FROM topnbench_data ORDER BY %1$I, e1 LIMIT 250000',
-           q.key_column),
-       5,
-       NULL
-FROM (VALUES (1, 'input-ascending', 'a'),
-             (2, 'input-descending', 'a_desc'),
-             (3, 'input-random', 'a_random'))
-     AS q(case_offset, case_name, key_column);
-
--- Correlated predicates create cardinality errors while preserving the true
--- input cardinality used by the paired manual strategies.
-INSERT INTO topnbench_case_definitions VALUES
-    (300, 'serial-stale', 'row-estimation', 'rows-underestimated',
-     $q$SELECT a_random AS k,
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('estimates/rows-underestimated', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
                topnbench_work_cost_1(a_random, 16, 1) AS e1
         FROM topnbench_data
         WHERE a <= 100000 AND same1 <= 100000 AND same2 <= 100000
-        ORDER BY a_random LIMIT 10000$q$,
-     $q$SELECT s.k, topnbench_work_cost_1(s.k, 16, 1) AS e1
+        ORDER BY a_random LIMIT 10000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('estimates/rows-underestimated', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+               topnbench_work_cost_1(a_random, 16, 1) AS e1
+        FROM topnbench_data
+        WHERE a <= 100000 AND same1 <= 100000 AND same2 <= 100000
+        ORDER BY a_random LIMIT 10000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('estimates/rows-underestimated', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+               topnbench_work_cost_1(a_random, 16, 1) AS e1
+        FROM topnbench_data
+        WHERE a <= 100000 AND same1 <= 100000 AND same2 <= 100000
+        ORDER BY a_random LIMIT 10000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('estimates/rows-underestimated', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(s.k, 16, 1) AS e1
         FROM (SELECT a_random AS k
               FROM topnbench_data
               WHERE a <= 100000 AND same1 <= 100000 AND same2 <= 100000
-              ORDER BY a_random LIMIT 10000) AS s$q$,
-     $q$SELECT a_random AS k,
+              ORDER BY a_random LIMIT 10000) AS s;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('estimates/rows-underestimated', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
                topnbench_work_cost_1(a_random, 16, 1) AS e1
         FROM topnbench_data
         WHERE a <= 100000 AND same1 <= 100000 AND same2 <= 100000
-        ORDER BY a_random, e1 LIMIT 10000$q$,
-     5, NULL),
-    (301, 'serial-stale', 'row-estimation', 'rows-overestimated',
-     $q$SELECT a_random AS k,
+        ORDER BY a_random, e1 LIMIT 10000;
+
+-- case: estimates/rows-overestimated
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('estimates/rows-overestimated', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
                topnbench_work_cost_1(a_random, 16, 1) AS e1
         FROM topnbench_data
         WHERE a <= 550000 AND inverse <= 550000
-        ORDER BY a_random LIMIT 50000$q$,
-     $q$SELECT s.k, topnbench_work_cost_1(s.k, 16, 1) AS e1
+        ORDER BY a_random LIMIT 50000;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('estimates/rows-overestimated', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+               topnbench_work_cost_1(a_random, 16, 1) AS e1
+        FROM topnbench_data
+        WHERE a <= 550000 AND inverse <= 550000
+        ORDER BY a_random LIMIT 50000;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('estimates/rows-overestimated', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+               topnbench_work_cost_1(a_random, 16, 1) AS e1
+        FROM topnbench_data
+        WHERE a <= 550000 AND inverse <= 550000
+        ORDER BY a_random LIMIT 50000;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('estimates/rows-overestimated', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(s.k, 16, 1) AS e1
         FROM (SELECT a_random AS k
               FROM topnbench_data
               WHERE a <= 550000 AND inverse <= 550000
-              ORDER BY a_random LIMIT 50000) AS s$q$,
-     $q$SELECT a_random AS k,
+              ORDER BY a_random LIMIT 50000) AS s;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('estimates/rows-overestimated', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
                topnbench_work_cost_1(a_random, 16, 1) AS e1
         FROM topnbench_data
         WHERE a <= 550000 AND inverse <= 550000
-        ORDER BY a_random, e1 LIMIT 50000$q$,
-     5, NULL);
+        ORDER BY a_random, e1 LIMIT 50000;
 
--- Preserve stale width statistics deliberately.  One table grows after
--- ANALYZE and the other shrinks, covering both error directions.
-CREATE UNLOGGED TABLE topnbench_width_underestimate
-(
-    a integer NOT NULL,
-    sort_key integer NOT NULL,
-    payload text NOT NULL
-) WITH (autovacuum_enabled = false);
-INSERT INTO topnbench_width_underestimate
-SELECT g,
-       ((g::bigint * 48271) % 100003)::integer,
-       'x'
-FROM generate_series(1, 100000) AS g;
-ANALYZE topnbench_width_underestimate;
-UPDATE topnbench_width_underestimate
-SET payload = md5(a::text || ':1') || md5(a::text || ':2') ||
-              md5(a::text || ':3') || md5(a::text || ':4') ||
-              md5(a::text || ':5') || md5(a::text || ':6') ||
-              md5(a::text || ':7') || md5(a::text || ':8');
--- Refresh relpages/reltuples without replacing the stale pg_statistic value.
-VACUUM topnbench_width_underestimate;
+-- case: estimates/projection-expands-tuple
+-- check: equivalent
 
-CREATE UNLOGGED TABLE topnbench_width_overestimate
-(
-    a integer NOT NULL,
-    payload text NOT NULL
-) WITH (autovacuum_enabled = false);
-INSERT INTO topnbench_width_overestimate
-SELECT g,
-       md5(g::text || ':1') || md5(g::text || ':2') ||
-       md5(g::text || ':3') || md5(g::text || ':4') ||
-       md5(g::text || ':5') || md5(g::text || ':6') ||
-       md5(g::text || ':7') || md5(g::text || ':8')
-FROM generate_series(1, 100000) AS g;
-ANALYZE topnbench_width_overestimate;
-UPDATE topnbench_width_overestimate SET payload = 'x';
-VACUUM topnbench_width_overestimate;
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('estimates/projection-expands-tuple', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k, repeat(md5(a_random::text), 8) AS e1
+        FROM topnbench_data ORDER BY a_random LIMIT 10000;
 
-SELECT q.case_name,
-       s.avg_width AS statistics_avg_width,
-       q.actual_avg_width
-FROM (
-    SELECT 'width-underestimated' AS case_name,
-           avg(pg_column_size(payload))::numeric(10, 2) AS actual_avg_width
-    FROM topnbench_width_underestimate
-    UNION ALL
-    SELECT 'width-overestimated',
-           avg(pg_column_size(payload))::numeric(10, 2)
-    FROM topnbench_width_overestimate
-) AS q
-JOIN LATERAL (
-    SELECT avg_width
-    FROM pg_stats
-    WHERE schemaname = current_schema()
-      AND tablename = CASE q.case_name
-            WHEN 'width-underestimated' THEN 'topnbench_width_underestimate'
-            ELSE 'topnbench_width_overestimate'
-          END
-      AND attname = 'payload'
-) AS s ON true;
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('estimates/projection-expands-tuple', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k, repeat(md5(a_random::text), 8) AS e1
+        FROM topnbench_data ORDER BY a_random LIMIT 10000;
 
--- Direct stale-width checks.
-INSERT INTO topnbench_case_definitions
-SELECT 400 + q.case_offset,
-       'serial-stale',
-       'width-estimation',
-       q.case_name,
-       format('SELECT a, length(payload) AS e1 FROM %I '
-              'ORDER BY a LIMIT 25000', q.relation_name),
-       format('SELECT s.a, length(s.payload) AS e1 '
-              'FROM (SELECT a, payload FROM %I '
-              'ORDER BY a LIMIT 25000) AS s', q.relation_name),
-       format('SELECT a, length(payload) AS e1 FROM %I '
-              'ORDER BY a, e1 LIMIT 25000', q.relation_name),
-       5,
-       NULL
-FROM (VALUES (1, 'width-underestimated',
-                 'topnbench_width_underestimate'),
-             (2, 'width-overestimated',
-                 'topnbench_width_overestimate'))
-     AS q(case_offset, case_name, relation_name);
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('estimates/projection-expands-tuple', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k, repeat(md5(a_random::text), 8) AS e1
+        FROM topnbench_data ORDER BY a_random LIMIT 10000;
 
--- Early evaluation expands a narrow integer into a wide text value.
-INSERT INTO topnbench_case_definitions VALUES
-    (450, 'serial-stale', 'tuple-width', 'projection-expands-tuple',
-     $q$SELECT a_random AS k, repeat(md5(a_random::text), 8) AS e1
-        FROM topnbench_data ORDER BY a_random LIMIT 10000$q$,
-     $q$SELECT s.k, repeat(md5(s.k::text), 8) AS e1
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('estimates/projection-expands-tuple', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, repeat(md5(s.k::text), 8) AS e1
         FROM (SELECT a_random AS k FROM topnbench_data
-              ORDER BY a_random LIMIT 10000) AS s$q$,
-     $q$SELECT a_random AS k, repeat(md5(a_random::text), 8) AS e1
-        FROM topnbench_data ORDER BY a_random, e1 LIMIT 10000$q$,
-     5, NULL);
+              ORDER BY a_random LIMIT 10000) AS s;
 
--- Sweep work_mem while stale statistics understate the source width.
-INSERT INTO topnbench_case_definitions
-SELECT 500 + q.case_offset,
-       'serial-stale',
-       'work-mem-stale-width',
-       format('width-shrinks-work-mem-%s', q.work_mem_setting),
-       $q$SELECT a, length(payload) AS e1
-          FROM topnbench_width_underestimate ORDER BY a LIMIT 5000$q$,
-       $q$SELECT s.a, length(s.payload) AS e1
-          FROM (SELECT a, payload FROM topnbench_width_underestimate
-                ORDER BY a LIMIT 5000) AS s$q$,
-       $q$SELECT a, length(payload) AS e1
-          FROM topnbench_width_underestimate ORDER BY a, e1 LIMIT 5000$q$,
-       5,
-       q.work_mem_setting
-FROM (VALUES (1, '64kB'), (2, '256kB'), (3, '1MB'), (4, '4MB'),
-             (5, '16MB'), (6, '64MB'), (7, '256MB'))
-     AS q(case_offset, work_mem_setting);
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('estimates/projection-expands-tuple', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k, repeat(md5(a_random::text), 8) AS e1
+        FROM topnbench_data ORDER BY a_random, e1 LIMIT 10000;
 
-\echo
-\echo '== Supplemental phase: stale statistics and adversarial inputs =='
+-- case: input-order/input-ascending
+-- check: equivalent
 
+-- variant: upstream-auto
+-- sample: plan
 SET enable_cost_based_delayed_projection = off;
 SET enable_sort_tuple_width_cost = off;
-INSERT INTO topnbench_supplemental_results
-SELECT 'master', d.case_order, d.phase, d.category, d.case_name, c.*
-FROM topnbench_case_definitions AS d
-CROSS JOIN LATERAL topnbench_compare(
-    d.auto_query, d.manual_late_query, d.forced_early_query,
-    d.iterations, false, d.work_mem_setting, true) AS c
-WHERE d.phase = 'serial-stale'
-ORDER BY d.case_order;
+SELECT topnbench_capture('input-order/input-ascending', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k,
+       topnbench_work_cost_1(a, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a
+LIMIT 250000;
 
+-- variant: path-only-auto
+-- sample: plan
 SET enable_cost_based_delayed_projection = on;
-INSERT INTO topnbench_supplemental_results
-SELECT 'path-only', d.case_order, d.phase, d.category, d.case_name, c.*
-FROM topnbench_case_definitions AS d
-CROSS JOIN LATERAL topnbench_compare(
-    d.auto_query, d.manual_late_query, d.forced_early_query,
-    d.iterations, false, d.work_mem_setting, true) AS c
-WHERE d.phase = 'serial-stale'
-ORDER BY d.case_order;
+SELECT topnbench_capture('input-order/input-ascending', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k,
+       topnbench_work_cost_1(a, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a
+LIMIT 250000;
 
+-- variant: auto
+-- sample: timed
 SET enable_sort_tuple_width_cost = on;
-INSERT INTO topnbench_supplemental_results
-SELECT 'patched', d.case_order, d.phase, d.category, d.case_name, c.*
-FROM topnbench_case_definitions AS d
-CROSS JOIN LATERAL topnbench_compare(
-    d.auto_query, d.manual_late_query, d.forced_early_query,
-    d.iterations, true, d.work_mem_setting, false) AS c
-WHERE d.phase = 'serial-stale'
-ORDER BY d.case_order;
+SELECT topnbench_capture('input-order/input-ascending', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k,
+       topnbench_work_cost_1(a, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a
+LIMIT 250000;
 
--- Repair avg_width and repeat only the work_mem sweep.  This separates a
--- weakness in costing from a decision caused by stale statistics.
-\echo '== Repeated regression probe: stale width, 256kB =='
-SELECT pg_temp.topnbench_diagnose('width-shrinks-work-mem-256kB',
-                                'topnbench_width_underestimate');
-ANALYZE topnbench_width_underestimate;
-SELECT avg_width AS repaired_statistics_avg_width
-FROM pg_stats
-WHERE schemaname = current_schema()
-  AND tablename = 'topnbench_width_underestimate'
-  AND attname = 'payload';
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('input-order/input-ascending', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a AS k FROM topnbench_data
+      ORDER BY a LIMIT 250000) AS s
+LIMIT 250000;
 
--- Build accurately analyzed relations whose payload width changes while row
--- count, key distribution, expression work, and work_mem remain fixed.  All
--- values stay below the normal TOAST threshold so the measured width is also
--- the number of payload bytes copied into an in-memory Sort tuple.
-SELECT format('DROP TABLE IF EXISTS %I',
-              format('topnbench_copy_width_%s', width_bytes))
-FROM unnest(ARRAY[8, 32, 128, 256, 512, 1024]) AS w(width_bytes)
-\gexec
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('input-order/input-ascending', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k,
+       topnbench_work_cost_1(a, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a, e1
+LIMIT 250000;
 
-SELECT format(
-           'CREATE UNLOGGED TABLE %1$I '
-           '(sort_key integer NOT NULL, payload text NOT NULL)',
-           format('topnbench_copy_width_%s', width_bytes))
-FROM unnest(ARRAY[8, 32, 128, 256, 512, 1024]) AS w(width_bytes)
-\gexec
+-- case: input-order/input-descending
+-- check: equivalent
 
-SELECT format(
-           'INSERT INTO %1$I '
-           'SELECT ((g::bigint * 48271) %% 100003)::integer, '
-           'left(repeat(md5(g::text), %2$s), %3$s) '
-           'FROM generate_series(1, 100000) AS g',
-           format('topnbench_copy_width_%s', width_bytes),
-           (width_bytes + 31) / 32,
-           width_bytes)
-FROM unnest(ARRAY[8, 32, 128, 256, 512, 1024]) AS w(width_bytes)
-\gexec
-
-SELECT format('ANALYZE %I',
-              format('topnbench_copy_width_%s', width_bytes))
-FROM unnest(ARRAY[8, 32, 128, 256, 512, 1024]) AS w(width_bytes)
-\gexec
-
-SELECT tablename,
-       avg_width
-FROM pg_stats
-WHERE schemaname = current_schema()
-  AND tablename LIKE 'topnbench_copy_width_%'
-  AND attname = 'payload'
-ORDER BY avg_width;
-
-\echo
-\echo '== Pure Sort width calibration =='
-
--- Unlike the early/late comparisons below, these query pairs contain no
--- computed target expressions.  Their only intended difference is whether
--- payload is carried through Sort, so the measured delta calibrates the new
--- width term without expression-cost or Result-node overhead.
-SET enable_cost_based_delayed_projection = on;
-SET enable_sort_tuple_width_cost = on;
-DROP TABLE IF EXISTS topnbench_sort_calibration_raw;
-CREATE TEMP TABLE topnbench_sort_calibration_raw AS
-SELECT w.width_bytes,
-       l.limit_order,
-       l.limit_label,
-       l.limit_rows,
-       s.shape,
-       m.*
-FROM (VALUES
-          (8, 'topnbench_copy_width_8'),
-          (32, 'topnbench_copy_width_32'),
-          (128, 'topnbench_copy_width_128'),
-          (256, 'topnbench_copy_width_256'),
-          (512, 'topnbench_copy_width_512'),
-          (1024, 'topnbench_copy_width_1024'))
-     AS w(width_bytes, relation_name)
-CROSS JOIN (VALUES (1, '1pct', 1000),
-                   (2, '25pct', 25000),
-                   (3, '50pct', 50000),
-                   (4, '100pct', 100000))
-     AS l(limit_order, limit_label, limit_rows)
-CROSS JOIN (VALUES ('narrow'), ('wide')) AS s(shape)
-CROSS JOIN LATERAL topnbench_measure(
-    format(
-        CASE s.shape
-            WHEN 'narrow' THEN
-                'SELECT sort_key FROM %1$I ORDER BY sort_key LIMIT %2$s'
-            ELSE
-                'SELECT sort_key, payload FROM %1$I '
-                'ORDER BY sort_key LIMIT %2$s'
-        END,
-        w.relation_name, l.limit_rows),
-    5, '1GB') AS m;
-
-DROP TABLE IF EXISTS topnbench_sort_calibration;
-CREATE TEMP TABLE topnbench_sort_calibration AS
-SELECT width_bytes,
-       limit_order,
-       limit_label,
-       limit_rows,
-       max(estimated_sort_width) FILTER (WHERE shape = 'narrow') AS
-           narrow_plan_width,
-       max(estimated_sort_width) FILTER (WHERE shape = 'wide') AS
-           wide_plan_width,
-       max(total_cost) FILTER (WHERE shape = 'narrow') AS narrow_cost,
-       max(total_cost) FILTER (WHERE shape = 'wide') AS wide_cost,
-       max(median_ms) FILTER (WHERE shape = 'narrow') AS narrow_ms,
-       max(median_ms) FILTER (WHERE shape = 'wide') AS wide_ms,
-       max(sort_space_used_kb) FILTER (WHERE shape = 'narrow') AS narrow_kb,
-       max(sort_space_used_kb) FILTER (WHERE shape = 'wide') AS wide_kb
-FROM topnbench_sort_calibration_raw
-GROUP BY width_bytes, limit_order, limit_label, limit_rows;
-
--- Four compact calibration rows are printed by default.  A low correlation
--- or a very early crossover means the constants need more work.
-SELECT limit_label,
-       min(width_bytes) FILTER
-           (WHERE wide_ms > narrow_ms * 1.10) AS first_width_10pct_slower,
-       round(max(wide_ms / NULLIF(narrow_ms, 0))::numeric, 3) AS
-           worst_wide_time_ratio,
-       round(corr(wide_cost - narrow_cost,
-                  wide_ms - narrow_ms)::numeric, 3) AS cost_time_correlation
-FROM topnbench_sort_calibration
-GROUP BY limit_order, limit_label
-ORDER BY limit_order;
-
-\if :topnbench_verbose
-SELECT width_bytes,
-       limit_label,
-       narrow_plan_width,
-       wide_plan_width,
-       round((wide_cost - narrow_cost)::numeric, 3) AS estimated_cost_delta,
-       round(narrow_ms::numeric, 3) AS narrow_ms,
-       round(wide_ms::numeric, 3) AS wide_ms,
-       round((wide_ms - narrow_ms)::numeric, 3) AS actual_ms_delta,
-       round((wide_ms / NULLIF(narrow_ms, 0))::numeric, 3) AS time_ratio,
-       round(narrow_kb::numeric, 0) AS narrow_kb,
-       round(wide_kb::numeric, 0) AS wide_kb
-FROM topnbench_sort_calibration
-ORDER BY limit_order, width_bytes;
-\endif
-
-INSERT INTO topnbench_case_definitions
-SELECT 600 + q.case_offset,
-       'serial-accurate-width',
-       'work-mem-accurate-width',
-       format('width-accurate-work-mem-%s', q.work_mem_setting),
-       $q$SELECT a, length(payload) AS e1
-          FROM topnbench_width_underestimate ORDER BY a LIMIT 5000$q$,
-       $q$SELECT s.a, length(s.payload) AS e1
-          FROM (SELECT a, payload FROM topnbench_width_underestimate
-                ORDER BY a LIMIT 5000) AS s$q$,
-       $q$SELECT a, length(payload) AS e1
-          FROM topnbench_width_underestimate ORDER BY a, e1 LIMIT 5000$q$,
-       5,
-       q.work_mem_setting
-FROM (VALUES (1, '64kB'), (2, '256kB'), (3, '1MB'), (4, '4MB'),
-             (5, '16MB'), (6, '64MB'), (7, '256MB'))
-     AS q(case_offset, work_mem_setting);
-
--- Negative controls for late projection.  In these cases early evaluation
--- can replace a 260-byte payload with a four-byte integer before sorting.
--- The existing COST 1 and COST 100 aliases share one C implementation and
--- receive the same octet_length input with zero work rounds, so this matrix
--- also tests whether an inaccurate procost can make the POC choose late when
--- early is actually faster.  The pseudo-random key avoids a physically
--- ordered input accidentally making Sort unusually cheap.
-INSERT INTO topnbench_case_definitions
-SELECT 700 + c.case_offset * 100 + l.case_offset * 10 + w.case_offset,
-       'serial-accurate-width',
-       'early-winner-controls',
-       format('early-control-%s-limit-%s-work-mem-%s',
-              c.cost_label, l.limit_label, w.work_mem_setting),
-       format(
-           'SELECT sort_key AS k, '
-           '%1$I(octet_length(payload), 0, 0) AS e1 '
-           'FROM topnbench_width_underestimate '
-           'ORDER BY sort_key LIMIT %2$s',
-           c.function_name, l.limit_rows),
-       format(
-           'SELECT s.k, '
-           '%1$I(octet_length(s.payload), 0, 0) AS e1 '
-           'FROM (SELECT sort_key AS k, payload '
-           'FROM topnbench_width_underestimate '
-           'ORDER BY sort_key LIMIT %2$s) AS s',
-           c.function_name, l.limit_rows),
-       format(
-           'SELECT sort_key AS k, '
-           '%1$I(octet_length(payload), 0, 0) AS e1 '
-           'FROM topnbench_width_underestimate '
-           'ORDER BY sort_key, e1 LIMIT %2$s',
-           c.function_name, l.limit_rows),
-       5,
-       w.work_mem_setting
-FROM (VALUES (0, 'cost-1', 'topnbench_work_cost_1'),
-             (1, 'cost-100', 'topnbench_work_cost_100'))
-     AS c(case_offset, cost_label, function_name)
-CROSS JOIN (VALUES (1, '25pct', 25000),
-                   (2, '50pct', 50000),
-                   (3, '75pct', 75000),
-                   (4, '100pct', 100000))
-           AS l(case_offset, limit_label, limit_rows)
-CROSS JOIN (VALUES (1, '64kB'), (2, '4MB'), (3, '256MB'))
-           AS w(case_offset, work_mem_setting);
-
--- Isolate the in-memory tuple-copy component of Sort costing.  The function
--- does no synthetic work and always returns an integer, so increasing the
--- source payload changes the late Sort width without changing the early Sort
--- width.  One gigabyte of work_mem keeps even the 1024-byte case in memory.
--- LIMIT 100% makes both placements execute the expression for every row;
--- smaller LIMITs show where expression savings outweigh tuple width.
-INSERT INTO topnbench_case_definitions
-SELECT 1000 + w.case_offset * 10 + l.case_offset,
-       'serial-accurate-width',
-       'tuple-copy-width',
-       format('tuple-copy-width-%s-limit-%s',
-              w.width_label, l.limit_label),
-       format(
-           'SELECT sort_key AS k, '
-           'topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1 '
-           'FROM %1$I ORDER BY sort_key LIMIT %2$s',
-           w.relation_name, l.limit_rows),
-       format(
-           'SELECT s.k, '
-           'topnbench_work_cost_1(octet_length(s.payload), 0, 0) AS e1 '
-           'FROM (SELECT sort_key AS k, payload FROM %1$I '
-           'ORDER BY sort_key LIMIT %2$s) AS s',
-           w.relation_name, l.limit_rows),
-       format(
-           'SELECT sort_key AS k, '
-           'topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1 '
-           'FROM %1$I ORDER BY sort_key, e1 LIMIT %2$s',
-           w.relation_name, l.limit_rows),
-       5,
-       '1GB'
-FROM (VALUES
-          (1, '8', 'topnbench_copy_width_8'),
-          (2, '32', 'topnbench_copy_width_32'),
-          (3, '128', 'topnbench_copy_width_128'),
-          (4, '256', 'topnbench_copy_width_256'),
-          (5, '512', 'topnbench_copy_width_512'),
-          (6, '1024', 'topnbench_copy_width_1024'))
-     AS w(case_offset, width_label, relation_name)
-CROSS JOIN (VALUES (1, '1pct', 1000),
-                   (2, '25pct', 25000),
-                   (3, '50pct', 50000),
-                   (4, '100pct', 100000))
-           AS l(case_offset, limit_label, limit_rows);
-
-\echo
-\echo '== Supplemental phase: repaired width and early-winner controls =='
-
+-- variant: upstream-auto
+-- sample: plan
 SET enable_cost_based_delayed_projection = off;
 SET enable_sort_tuple_width_cost = off;
-INSERT INTO topnbench_supplemental_results
-SELECT 'master', d.case_order, d.phase, d.category, d.case_name, c.*
-FROM topnbench_case_definitions AS d
-CROSS JOIN LATERAL topnbench_compare(
-    d.auto_query, d.manual_late_query, d.forced_early_query,
-    d.iterations, false, d.work_mem_setting, true) AS c
-WHERE d.phase = 'serial-accurate-width'
-ORDER BY d.case_order;
+SELECT topnbench_capture('input-order/input-descending', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_desc AS k,
+       topnbench_work_cost_1(a_desc, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_desc
+LIMIT 250000;
 
+-- variant: path-only-auto
+-- sample: plan
 SET enable_cost_based_delayed_projection = on;
-INSERT INTO topnbench_supplemental_results
-SELECT 'path-only', d.case_order, d.phase, d.category, d.case_name, c.*
-FROM topnbench_case_definitions AS d
-CROSS JOIN LATERAL topnbench_compare(
-    d.auto_query, d.manual_late_query, d.forced_early_query,
-    d.iterations, false, d.work_mem_setting, true) AS c
-WHERE d.phase = 'serial-accurate-width'
-ORDER BY d.case_order;
+SELECT topnbench_capture('input-order/input-descending', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_desc AS k,
+       topnbench_work_cost_1(a_desc, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_desc
+LIMIT 250000;
 
+-- variant: auto
+-- sample: timed
 SET enable_sort_tuple_width_cost = on;
-INSERT INTO topnbench_supplemental_results
-SELECT 'patched', d.case_order, d.phase, d.category, d.case_name, c.*
-FROM topnbench_case_definitions AS d
-CROSS JOIN LATERAL topnbench_compare(
-    d.auto_query, d.manual_late_query, d.forced_early_query,
-    d.iterations, true, d.work_mem_setting, false) AS c
-WHERE d.phase = 'serial-accurate-width'
-ORDER BY d.case_order;
+SELECT topnbench_capture('input-order/input-descending', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_desc AS k,
+       topnbench_work_cost_1(a_desc, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_desc
+LIMIT 250000;
 
-\echo '== Repeated regression probes: repaired width and in-memory boundary =='
-SELECT pg_temp.topnbench_diagnose('width-accurate-work-mem-256kB',
-                                'topnbench_width_underestimate');
-SELECT pg_temp.topnbench_diagnose('tuple-copy-width-128-limit-25pct',
-                                'topnbench_copy_width_128');
-SELECT pg_temp.topnbench_diagnose('tuple-copy-width-256-limit-25pct',
-                                'topnbench_copy_width_256');
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('input-order/input-descending', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_desc AS k FROM topnbench_data
+      ORDER BY a_desc LIMIT 250000) AS s
+LIMIT 250000;
 
-RESET max_parallel_workers_per_gather;
-RESET work_mem;
-RESET enable_cost_based_delayed_projection;
-RESET enable_sort_tuple_width_cost;
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('input-order/input-descending', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_desc AS k,
+       topnbench_work_cost_1(a_desc, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_desc, e1
+LIMIT 250000;
 
-\echo
-\echo '== Supplemental policy comparison =='
+-- case: input-order/input-random
+-- check: equivalent
 
-DROP TABLE IF EXISTS topnbench_supplemental_comparison;
-CREATE TEMP TABLE topnbench_supplemental_comparison AS
--- Master and path-only supply plans only.  The patched row supplies the one
--- measured early/late winner used to score all three decisions.
-WITH paired AS
-(
-    SELECT p.case_order,
-           p.phase,
-           p.category,
-           p.case_name,
-           m.planner_choice AS master_choice,
-           o.planner_choice AS path_only_choice,
-           p.planner_choice AS patched_choice,
-           p.actual_winner AS patched_actual_winner,
-           p.decision_class AS patched_decision_class,
-           CASE m.planner_choice
-               WHEN 'late' THEN p.manual_late_median_ms
-               WHEN 'early' THEN p.forced_early_median_ms
-           END AS master_strategy_ms,
-           CASE p.planner_choice
-               WHEN 'late' THEN p.manual_late_median_ms
-               WHEN 'early' THEN p.forced_early_median_ms
-           END AS patched_strategy_ms,
-           CASE o.planner_choice
-               WHEN 'late' THEN p.manual_late_median_ms
-               WHEN 'early' THEN p.forced_early_median_ms
-           END AS path_only_strategy_ms
-    FROM topnbench_supplemental_results AS p
-    JOIN topnbench_supplemental_results AS m
-      ON m.case_name = p.case_name
-     AND m.policy = 'master'
-    JOIN topnbench_supplemental_results AS o
-      ON o.case_name = p.case_name
-     AND o.policy = 'path-only'
-    WHERE p.policy = 'patched'
-), classified AS
-(
-    SELECT paired.*,
-           CASE
-               WHEN master_choice IS NULL OR patched_choice IS NULL OR
-                    master_choice = 'unknown' OR
-                    patched_choice = 'unknown' OR
-                    patched_actual_winner = 'tie'
-                   THEN 'inconclusive'
-               WHEN master_choice = patched_choice AND
-                    patched_choice = patched_actual_winner
-                   THEN 'unchanged-correct'
-               WHEN master_choice = patched_choice
-                   THEN 'unchanged-miss'
-               WHEN patched_choice = patched_actual_winner
-                   THEN 'improvement'
-               WHEN master_choice = patched_actual_winner
-                   THEN 'regression'
-               ELSE 'inconclusive'
-           END AS patch_effect,
-           CASE
-               WHEN master_choice IS NULL OR path_only_choice IS NULL OR
-                    master_choice = 'unknown' OR
-                    path_only_choice = 'unknown' OR
-                    patched_actual_winner = 'tie'
-                   THEN 'inconclusive'
-               WHEN master_choice = path_only_choice AND
-                    path_only_choice = patched_actual_winner
-                   THEN 'unchanged-correct'
-               WHEN master_choice = path_only_choice
-                   THEN 'unchanged-miss'
-               WHEN path_only_choice = patched_actual_winner
-                   THEN 'improvement'
-               WHEN master_choice = patched_actual_winner
-                   THEN 'regression'
-               ELSE 'inconclusive'
-           END AS path_only_effect,
-           CASE
-               WHEN path_only_choice IS NULL OR patched_choice IS NULL OR
-                    path_only_choice = 'unknown' OR
-                    patched_choice = 'unknown' OR
-                    patched_actual_winner = 'tie'
-                   THEN 'inconclusive'
-               WHEN path_only_choice = patched_choice AND
-                    patched_choice = patched_actual_winner
-                   THEN 'unchanged-correct'
-               WHEN path_only_choice = patched_choice
-                   THEN 'unchanged-miss'
-               WHEN patched_choice = patched_actual_winner
-                   THEN 'improvement'
-               WHEN path_only_choice = patched_actual_winner
-                   THEN 'regression'
-               ELSE 'inconclusive'
-           END AS width_cost_effect
-    FROM paired
-)
-SELECT classified.*,
-       master_strategy_ms / NULLIF(patched_strategy_ms, 0) AS
-           patch_vs_master_speedup,
-       path_only_strategy_ms / NULLIF(patched_strategy_ms, 0) AS
-           width_cost_vs_path_only_speedup
-FROM classified;
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('input-order/input-random', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
 
--- Compact per-case result: one row describes all three planner policies.
-\if :topnbench_verbose
-SELECT category,
-       case_name,
-       master_choice,
-       path_only_choice,
-       patched_choice,
-       patched_actual_winner AS actual_winner,
-       patch_effect,
-       path_only_effect,
-       width_cost_effect,
-       round(master_strategy_ms::numeric, 3) AS master_strategy_ms,
-       round(patched_strategy_ms::numeric, 3) AS patched_strategy_ms,
-       round(patch_vs_master_speedup::numeric, 3) AS
-           patch_vs_master_speedup
-FROM topnbench_supplemental_comparison
-ORDER BY case_order;
-\endif
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('input-order/input-random', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
 
--- Summarize each test category and the complete supplemental suite.
-SELECT CASE WHEN GROUPING(category) = 1 THEN 'ALL' ELSE category END AS category,
-       count(*) AS cases,
-       count(*) FILTER (WHERE patched_actual_winner = 'late') AS late_wins,
-       count(*) FILTER (WHERE patched_actual_winner = 'early') AS early_wins,
-       count(*) FILTER (WHERE patched_actual_winner = 'tie') AS ties,
-       count(*) FILTER (WHERE master_choice <> patched_choice) AS
-           changed_choices,
-       count(*) FILTER (WHERE patch_effect = 'improvement') AS improvements,
-       count(*) FILTER (WHERE patch_effect = 'regression') AS new_regressions,
-       count(*) FILTER (WHERE patch_effect = 'unchanged-miss') AS
-           unchanged_misses,
-       count(*) FILTER (WHERE patch_effect = 'inconclusive') AS inconclusive,
-       count(*) FILTER (WHERE master_choice <> path_only_choice) AS
-           path_only_changes,
-       count(*) FILTER (WHERE path_only_effect = 'improvement') AS
-           path_only_improvements,
-       count(*) FILTER (WHERE path_only_effect = 'regression') AS
-           path_only_regressions,
-       count(*) FILTER (WHERE path_only_choice <> patched_choice) AS
-           width_cost_changes,
-       count(*) FILTER (WHERE width_cost_effect = 'improvement') AS
-           width_cost_improvements,
-       count(*) FILTER (WHERE width_cost_effect = 'regression') AS
-           width_cost_regressions,
-       round(max(CASE WHEN patch_effect = 'improvement'
-                      THEN patch_vs_master_speedup END)::numeric, 3) AS
-           best_new_speedup,
-       round(max(CASE WHEN patch_effect = 'regression'
-                      THEN 1.0 / patch_vs_master_speedup END)::numeric, 3) AS
-           worst_new_regret
-FROM topnbench_supplemental_comparison
-GROUP BY GROUPING SETS ((category), ())
-ORDER BY GROUPING(category), category;
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('input-order/input-random', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
 
-\echo
-\echo '== Combined quick and supplemental summary =='
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('input-order/input-random', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
 
-WITH all_comparisons AS
-(
-    SELECT 'quick'::text AS suite,
-           master_choice,
-           path_only_choice,
-           patched_choice,
-           patched_actual_winner AS actual_winner,
-           patch_effect,
-           path_only_effect,
-           width_cost_effect,
-           patch_vs_master_speedup,
-           width_cost_vs_path_only_speedup
-    FROM topnbench_choice_comparison
-    UNION ALL
-    SELECT 'supplemental',
-           master_choice,
-           path_only_choice,
-           patched_choice,
-           patched_actual_winner,
-           patch_effect,
-           path_only_effect,
-           width_cost_effect,
-           patch_vs_master_speedup,
-           width_cost_vs_path_only_speedup
-    FROM topnbench_supplemental_comparison
-)
-SELECT CASE WHEN GROUPING(suite) = 1 THEN 'ALL' ELSE suite END AS suite,
-       count(*) AS cases,
-       count(*) FILTER (WHERE actual_winner = 'late') AS late_wins,
-       count(*) FILTER (WHERE actual_winner = 'early') AS early_wins,
-       count(*) FILTER (WHERE actual_winner = 'tie') AS ties,
-       count(*) FILTER (WHERE master_choice <> patched_choice) AS
-           changed_choices,
-       count(*) FILTER (WHERE patch_effect = 'improvement') AS improvements,
-       count(*) FILTER (WHERE patch_effect = 'regression') AS new_regressions,
-       count(*) FILTER (WHERE patch_effect = 'unchanged-miss') AS
-           unchanged_misses,
-       count(*) FILTER (WHERE patch_effect = 'inconclusive') AS inconclusive,
-       count(*) FILTER (WHERE master_choice <> path_only_choice) AS
-           path_only_changes,
-       count(*) FILTER (WHERE path_only_effect = 'improvement') AS
-           path_only_improvements,
-       count(*) FILTER (WHERE path_only_effect = 'regression') AS
-           path_only_regressions,
-       count(*) FILTER (WHERE path_only_choice <> patched_choice) AS
-           width_cost_changes,
-       count(*) FILTER (WHERE width_cost_effect = 'improvement') AS
-           width_cost_improvements,
-       count(*) FILTER (WHERE width_cost_effect = 'regression') AS
-           width_cost_regressions,
-       round(max(CASE WHEN patch_effect = 'improvement'
-                      THEN patch_vs_master_speedup END)::numeric, 3) AS
-           best_new_speedup,
-       round(max(CASE WHEN patch_effect = 'regression'
-                      THEN 1.0 / patch_vs_master_speedup END)::numeric, 3) AS
-           worst_new_regret
-FROM all_comparisons
-GROUP BY GROUPING SETS ((suite), ())
-ORDER BY GROUPING(suite), suite;
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('input-order/input-random', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
 
-\echo
-\echo '== Actionable wrong choices and new regressions =='
+-- case: estimates/width-underestimate
+-- check: equivalent
 
-WITH actionable AS
-(
-    SELECT 'quick'::text AS suite,
-           'generated'::text AS category,
-           c.case_name,
-           c.path_only_choice,
-           c.patched_choice,
-           c.patched_actual_winner AS actual_winner,
-           c.patch_effect,
-           c.path_only_effect,
-           c.width_cost_effect,
-           p.choice_regression_ratio AS regret
-    FROM topnbench_choice_comparison AS c
-    JOIN topnbench_results AS p USING (case_name)
-    UNION ALL
-    SELECT 'supplemental',
-           c.category,
-           c.case_name,
-           c.path_only_choice,
-           c.patched_choice,
-           c.patched_actual_winner,
-           c.patch_effect,
-           c.path_only_effect,
-           c.width_cost_effect,
-           p.choice_regression_ratio
-    FROM topnbench_supplemental_comparison AS c
-    JOIN topnbench_supplemental_results AS p
-      ON p.case_name = c.case_name
-     AND p.policy = 'patched'
-)
-SELECT suite,
-       category,
-       case_name,
-       path_only_choice,
-       patched_choice,
-       actual_winner,
-       patch_effect,
-       path_only_effect,
-       width_cost_effect,
-       round(regret::numeric, 3) AS regret
-FROM actionable
-WHERE patch_effect = 'regression'
-   OR path_only_effect = 'regression'
-   OR width_cost_effect = 'regression'
-   OR regret >= 1.20
-ORDER BY suite, category, case_name;
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('estimates/width-underestimate', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 25000 OFFSET 0;
 
-\if :topnbench_verbose
-\echo
-\echo '== Candidate path costs for unresolved decisions =='
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('estimates/width-underestimate', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 25000 OFFSET 0;
 
--- These are the surviving early/late Paths from the POC's own
--- UPPERREL_ORDERED pathlist, not estimates obtained from rewritten SQL.
-WITH candidate_diagnostics AS
-(
-    SELECT 'quick'::text AS suite,
-           'generated'::text AS category,
-           c.case_name,
-           c.patched_choice AS planner_choice,
-           c.patched_actual_winner AS actual_winner,
-           c.patch_effect,
-           p.lower_limit_cost_choice,
-           p.costs_within_1pct,
-           p.early_startup_cost,
-           p.early_total_cost,
-           p.early_limit_cost,
-           p.early_sort_rows,
-           p.early_sort_width,
-           p.late_startup_cost,
-           p.late_total_cost,
-           p.late_limit_cost,
-           p.late_sort_rows,
-           p.late_sort_width,
-           p.estimated_late_vs_early_cost
-    FROM topnbench_choice_comparison AS c
-    JOIN topnbench_results AS p USING (case_name)
-    UNION ALL
-    SELECT 'supplemental',
-           c.category,
-           c.case_name,
-           c.patched_choice,
-           c.patched_actual_winner,
-           c.patch_effect,
-           p.lower_limit_cost_choice,
-           p.costs_within_1pct,
-           p.early_startup_cost,
-           p.early_total_cost,
-           p.early_limit_cost,
-           p.early_sort_rows,
-           p.early_sort_width,
-           p.late_startup_cost,
-           p.late_total_cost,
-           p.late_limit_cost,
-           p.late_sort_rows,
-           p.late_sort_width,
-           p.estimated_late_vs_early_cost
-    FROM topnbench_supplemental_comparison AS c
-    JOIN topnbench_supplemental_results AS p
-      ON p.case_name = c.case_name
-     AND p.policy = 'patched'
-)
-SELECT suite,
-       category,
-       case_name,
-       planner_choice,
-       lower_limit_cost_choice,
-       costs_within_1pct,
-       actual_winner,
-       patch_effect,
-       round(early_startup_cost::numeric, 3) AS early_startup,
-       round(early_total_cost::numeric, 3) AS early_total,
-       round(early_limit_cost::numeric, 3) AS early_to_limit,
-       round(early_sort_rows::numeric, 0) AS early_sort_rows,
-       early_sort_width,
-       round(late_startup_cost::numeric, 3) AS late_startup,
-       round(late_total_cost::numeric, 3) AS late_total,
-       round(late_limit_cost::numeric, 3) AS late_to_limit,
-       round(late_sort_rows::numeric, 0) AS late_sort_rows,
-       late_sort_width,
-       round(estimated_late_vs_early_cost::numeric, 4) AS
-           estimated_late_vs_early
-FROM candidate_diagnostics
-WHERE patch_effect IN ('regression', 'unchanged-miss', 'inconclusive')
-ORDER BY suite, category, case_name;
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('estimates/width-underestimate', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 25000 OFFSET 0;
 
-\echo
-\echo '== Supplemental misses, regressions, and inconclusive cases =='
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('estimates/width-underestimate', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, length(payload) AS e1
+FROM (SELECT a AS k, payload FROM topnbench_width_underestimate
+      ORDER BY a LIMIT 25000) AS s
+LIMIT 25000 OFFSET 0;
 
--- Print wider diagnostics only for cases that still need investigation.
-SELECT c.category,
-       c.case_name,
-       c.master_choice,
-       c.patched_choice,
-       c.patched_actual_winner AS actual_winner,
-       c.patch_effect,
-       round(p.row_estimation_ratio::numeric, 3) AS row_estimation_ratio,
-       p.estimated_sort_width,
-       p.sort_method,
-       p.sort_space_type,
-       round(p.sort_space_used_kb::numeric, 0) AS sort_kb,
-       round(p.manual_late_median_ms::numeric, 3) AS late_ms,
-       round(p.forced_early_median_ms::numeric, 3) AS early_ms,
-       round(p.choice_regression_ratio::numeric, 3) AS choice_regret,
-       p.manual_late_sort_method AS late_sort_method,
-       round(p.manual_late_sort_space_used_kb::numeric, 0) AS late_sort_kb,
-       p.forced_early_sort_method AS early_sort_method,
-       round(p.forced_early_sort_space_used_kb::numeric, 0) AS early_sort_kb
-FROM topnbench_supplemental_comparison AS c
-JOIN topnbench_supplemental_results AS p
-  ON p.case_name = c.case_name
- AND p.policy = 'patched'
-WHERE c.patch_effect IN ('regression', 'unchanged-miss', 'inconclusive')
-ORDER BY c.case_order;
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('estimates/width-underestimate', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a, e1
+LIMIT 25000 OFFSET 0;
 
--- Projection signatures are noisy, so show them only when classification
--- failed instead of widening every result row.
-SELECT c.category,
-       c.case_name,
-       p.auto_sort_output,
-       p.manual_late_sort_output,
-       p.forced_early_sort_output
-FROM topnbench_supplemental_comparison AS c
-JOIN topnbench_supplemental_results AS p
-  ON p.case_name = c.case_name
- AND p.policy = 'patched'
-WHERE c.master_choice = 'unknown' OR c.patched_choice = 'unknown'
-ORDER BY c.case_order;
-\endif
+-- case: estimates/width-overestimate
+-- check: equivalent
 
-\ir regression_report.sql
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('estimates/width-overestimate', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_overestimate
+ORDER BY a
+LIMIT 25000 OFFSET 0;
 
--- Compare the 0011 policy with complete-result candidate pruning directly.
-\ir final_cost.sql
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('estimates/width-overestimate', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_overestimate
+ORDER BY a
+LIMIT 25000 OFFSET 0;
 
-\ir sort_representation.sql
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('estimates/width-overestimate', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_overestimate
+ORDER BY a
+LIMIT 25000 OFFSET 0;
 
-\ir datum_cost.sql
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('estimates/width-overestimate', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, length(payload) AS e1
+FROM (SELECT a AS k, payload FROM topnbench_width_overestimate
+      ORDER BY a LIMIT 25000) AS s
+LIMIT 25000 OFFSET 0;
 
-\ir sort_boundary.sql
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('estimates/width-overestimate', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_overestimate
+ORDER BY a, e1
+LIMIT 25000 OFFSET 0;
 
-\ir sort_algorithm.sql
+-- case: width-stale/work-mem-64kB
+-- check: equivalent
+SET work_mem = '64kB';
 
-\ir projection_placement.sql
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('width-stale/work-mem-64kB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
 
--- Keep execution tracing after every timed section.
-\ir sort_memory.sql
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('width-stale/work-mem-64kB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
 
-\ir heap_release.sql
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('width-stale/work-mem-64kB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('width-stale/work-mem-64kB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, length(payload) AS e1
+FROM (SELECT a AS k, payload FROM topnbench_width_underestimate
+      ORDER BY a LIMIT 5000) AS s
+LIMIT 5000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('width-stale/work-mem-64kB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a, e1
+LIMIT 5000 OFFSET 0;
+
+-- case: width-stale/work-mem-256kB
+-- check: equivalent
+SET work_mem = '256kB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('width-stale/work-mem-256kB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('width-stale/work-mem-256kB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('width-stale/work-mem-256kB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('width-stale/work-mem-256kB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, length(payload) AS e1
+FROM (SELECT a AS k, payload FROM topnbench_width_underestimate
+      ORDER BY a LIMIT 5000) AS s
+LIMIT 5000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('width-stale/work-mem-256kB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a, e1
+LIMIT 5000 OFFSET 0;
+
+-- case: width-stale/work-mem-1MB
+-- check: equivalent
+SET work_mem = '1MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('width-stale/work-mem-1MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('width-stale/work-mem-1MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('width-stale/work-mem-1MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('width-stale/work-mem-1MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, length(payload) AS e1
+FROM (SELECT a AS k, payload FROM topnbench_width_underestimate
+      ORDER BY a LIMIT 5000) AS s
+LIMIT 5000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('width-stale/work-mem-1MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a, e1
+LIMIT 5000 OFFSET 0;
+
+-- case: width-stale/work-mem-4MB
+-- check: equivalent
+SET work_mem = '4MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('width-stale/work-mem-4MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('width-stale/work-mem-4MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('width-stale/work-mem-4MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('width-stale/work-mem-4MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, length(payload) AS e1
+FROM (SELECT a AS k, payload FROM topnbench_width_underestimate
+      ORDER BY a LIMIT 5000) AS s
+LIMIT 5000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('width-stale/work-mem-4MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a, e1
+LIMIT 5000 OFFSET 0;
+
+-- case: width-stale/work-mem-16MB
+-- check: equivalent
+SET work_mem = '16MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('width-stale/work-mem-16MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('width-stale/work-mem-16MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('width-stale/work-mem-16MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('width-stale/work-mem-16MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, length(payload) AS e1
+FROM (SELECT a AS k, payload FROM topnbench_width_underestimate
+      ORDER BY a LIMIT 5000) AS s
+LIMIT 5000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('width-stale/work-mem-16MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a, e1
+LIMIT 5000 OFFSET 0;
+
+-- case: width-stale/work-mem-64MB
+-- check: equivalent
+SET work_mem = '64MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('width-stale/work-mem-64MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('width-stale/work-mem-64MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('width-stale/work-mem-64MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('width-stale/work-mem-64MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, length(payload) AS e1
+FROM (SELECT a AS k, payload FROM topnbench_width_underestimate
+      ORDER BY a LIMIT 5000) AS s
+LIMIT 5000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('width-stale/work-mem-64MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a, e1
+LIMIT 5000 OFFSET 0;
+
+-- case: width-stale/work-mem-256MB
+-- check: equivalent
+SET work_mem = '256MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('width-stale/work-mem-256MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('width-stale/work-mem-256MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('width-stale/work-mem-256MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('width-stale/work-mem-256MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, length(payload) AS e1
+FROM (SELECT a AS k, payload FROM topnbench_width_underestimate
+      ORDER BY a LIMIT 5000) AS s
+LIMIT 5000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('width-stale/work-mem-256MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a, e1
+LIMIT 5000 OFFSET 0;
+
+-- case: width-accurate/work-mem-64kB
+-- check: equivalent
+SET work_mem = '64kB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('width-accurate/work-mem-64kB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('width-accurate/work-mem-64kB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('width-accurate/work-mem-64kB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('width-accurate/work-mem-64kB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, length(payload) AS e1
+FROM (SELECT a AS k, payload FROM topnbench_width_accurate
+      ORDER BY a LIMIT 5000) AS s
+LIMIT 5000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('width-accurate/work-mem-64kB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a, e1
+LIMIT 5000 OFFSET 0;
+
+-- case: width-accurate/work-mem-256kB
+-- check: equivalent
+SET work_mem = '256kB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('width-accurate/work-mem-256kB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('width-accurate/work-mem-256kB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('width-accurate/work-mem-256kB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('width-accurate/work-mem-256kB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, length(payload) AS e1
+FROM (SELECT a AS k, payload FROM topnbench_width_accurate
+      ORDER BY a LIMIT 5000) AS s
+LIMIT 5000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('width-accurate/work-mem-256kB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a, e1
+LIMIT 5000 OFFSET 0;
+
+-- case: width-accurate/work-mem-1MB
+-- check: equivalent
+SET work_mem = '1MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('width-accurate/work-mem-1MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('width-accurate/work-mem-1MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('width-accurate/work-mem-1MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('width-accurate/work-mem-1MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, length(payload) AS e1
+FROM (SELECT a AS k, payload FROM topnbench_width_accurate
+      ORDER BY a LIMIT 5000) AS s
+LIMIT 5000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('width-accurate/work-mem-1MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a, e1
+LIMIT 5000 OFFSET 0;
+
+-- case: width-accurate/work-mem-4MB
+-- check: equivalent
+SET work_mem = '4MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('width-accurate/work-mem-4MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('width-accurate/work-mem-4MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('width-accurate/work-mem-4MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('width-accurate/work-mem-4MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, length(payload) AS e1
+FROM (SELECT a AS k, payload FROM topnbench_width_accurate
+      ORDER BY a LIMIT 5000) AS s
+LIMIT 5000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('width-accurate/work-mem-4MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a, e1
+LIMIT 5000 OFFSET 0;
+
+-- case: width-accurate/work-mem-16MB
+-- check: equivalent
+SET work_mem = '16MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('width-accurate/work-mem-16MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('width-accurate/work-mem-16MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('width-accurate/work-mem-16MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('width-accurate/work-mem-16MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, length(payload) AS e1
+FROM (SELECT a AS k, payload FROM topnbench_width_accurate
+      ORDER BY a LIMIT 5000) AS s
+LIMIT 5000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('width-accurate/work-mem-16MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a, e1
+LIMIT 5000 OFFSET 0;
+
+-- case: width-accurate/work-mem-64MB
+-- check: equivalent
+SET work_mem = '64MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('width-accurate/work-mem-64MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('width-accurate/work-mem-64MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('width-accurate/work-mem-64MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('width-accurate/work-mem-64MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, length(payload) AS e1
+FROM (SELECT a AS k, payload FROM topnbench_width_accurate
+      ORDER BY a LIMIT 5000) AS s
+LIMIT 5000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('width-accurate/work-mem-64MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a, e1
+LIMIT 5000 OFFSET 0;
+
+-- case: width-accurate/work-mem-256MB
+-- check: equivalent
+SET work_mem = '256MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('width-accurate/work-mem-256MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('width-accurate/work-mem-256MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('width-accurate/work-mem-256MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('width-accurate/work-mem-256MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, length(payload) AS e1
+FROM (SELECT a AS k, payload FROM topnbench_width_accurate
+      ORDER BY a LIMIT 5000) AS s
+LIMIT 5000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('width-accurate/work-mem-256MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a, e1
+LIMIT 5000 OFFSET 0;
+
+-- case: early-controls/cost-1-limit-25pct/64kB
+-- check: equivalent
+SET work_mem = '64kB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-1-limit-25pct/64kB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-25pct/64kB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-25pct/64kB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-25pct/64kB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 25000) AS s
+LIMIT 25000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-25pct/64kB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: early-controls/cost-1-limit-25pct/4MB
+-- check: equivalent
+SET work_mem = '4MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-1-limit-25pct/4MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-25pct/4MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-25pct/4MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-25pct/4MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 25000) AS s
+LIMIT 25000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-25pct/4MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: early-controls/cost-1-limit-25pct/256MB
+-- check: equivalent
+SET work_mem = '256MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-1-limit-25pct/256MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-25pct/256MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-25pct/256MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-25pct/256MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 25000) AS s
+LIMIT 25000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-25pct/256MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: early-controls/cost-1-limit-50pct/64kB
+-- check: equivalent
+SET work_mem = '64kB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-1-limit-50pct/64kB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-50pct/64kB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-50pct/64kB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-50pct/64kB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 50000) AS s
+LIMIT 50000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-50pct/64kB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 50000 OFFSET 0;
+
+-- case: early-controls/cost-1-limit-50pct/4MB
+-- check: equivalent
+SET work_mem = '4MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-1-limit-50pct/4MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-50pct/4MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-50pct/4MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-50pct/4MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 50000) AS s
+LIMIT 50000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-50pct/4MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 50000 OFFSET 0;
+
+-- case: early-controls/cost-1-limit-50pct/256MB
+-- check: equivalent
+SET work_mem = '256MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-1-limit-50pct/256MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-50pct/256MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-50pct/256MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-50pct/256MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 50000) AS s
+LIMIT 50000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-50pct/256MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 50000 OFFSET 0;
+
+-- case: early-controls/cost-1-limit-75pct/64kB
+-- check: equivalent
+SET work_mem = '64kB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-1-limit-75pct/64kB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 75000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-75pct/64kB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 75000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-75pct/64kB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 75000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-75pct/64kB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 75000) AS s
+LIMIT 75000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-75pct/64kB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 75000 OFFSET 0;
+
+-- case: early-controls/cost-1-limit-75pct/4MB
+-- check: equivalent
+SET work_mem = '4MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-1-limit-75pct/4MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 75000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-75pct/4MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 75000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-75pct/4MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 75000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-75pct/4MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 75000) AS s
+LIMIT 75000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-75pct/4MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 75000 OFFSET 0;
+
+-- case: early-controls/cost-1-limit-75pct/256MB
+-- check: equivalent
+SET work_mem = '256MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-1-limit-75pct/256MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 75000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-75pct/256MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 75000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-75pct/256MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 75000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-75pct/256MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 75000) AS s
+LIMIT 75000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-75pct/256MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 75000 OFFSET 0;
+
+-- case: early-controls/cost-1-limit-100pct/64kB
+-- check: equivalent
+SET work_mem = '64kB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-1-limit-100pct/64kB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-100pct/64kB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-100pct/64kB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-100pct/64kB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 100000) AS s
+LIMIT 100000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-100pct/64kB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 100000 OFFSET 0;
+
+-- case: early-controls/cost-1-limit-100pct/4MB
+-- check: equivalent
+SET work_mem = '4MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-1-limit-100pct/4MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-100pct/4MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-100pct/4MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-100pct/4MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 100000) AS s
+LIMIT 100000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-100pct/4MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 100000 OFFSET 0;
+
+-- case: early-controls/cost-1-limit-100pct/256MB
+-- check: equivalent
+SET work_mem = '256MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-1-limit-100pct/256MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-100pct/256MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-1-limit-100pct/256MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-100pct/256MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 100000) AS s
+LIMIT 100000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-1-limit-100pct/256MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 100000 OFFSET 0;
+
+-- case: early-controls/cost-100-limit-25pct/64kB
+-- check: equivalent
+SET work_mem = '64kB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-100-limit-25pct/64kB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-25pct/64kB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-25pct/64kB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-25pct/64kB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 25000) AS s
+LIMIT 25000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-25pct/64kB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: early-controls/cost-100-limit-25pct/4MB
+-- check: equivalent
+SET work_mem = '4MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-100-limit-25pct/4MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-25pct/4MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-25pct/4MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-25pct/4MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 25000) AS s
+LIMIT 25000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-25pct/4MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: early-controls/cost-100-limit-25pct/256MB
+-- check: equivalent
+SET work_mem = '256MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-100-limit-25pct/256MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-25pct/256MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-25pct/256MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-25pct/256MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 25000) AS s
+LIMIT 25000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-25pct/256MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: early-controls/cost-100-limit-50pct/64kB
+-- check: equivalent
+SET work_mem = '64kB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-100-limit-50pct/64kB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-50pct/64kB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-50pct/64kB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-50pct/64kB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 50000) AS s
+LIMIT 50000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-50pct/64kB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 50000 OFFSET 0;
+
+-- case: early-controls/cost-100-limit-50pct/4MB
+-- check: equivalent
+SET work_mem = '4MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-100-limit-50pct/4MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-50pct/4MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-50pct/4MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-50pct/4MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 50000) AS s
+LIMIT 50000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-50pct/4MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 50000 OFFSET 0;
+
+-- case: early-controls/cost-100-limit-50pct/256MB
+-- check: equivalent
+SET work_mem = '256MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-100-limit-50pct/256MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-50pct/256MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-50pct/256MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-50pct/256MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 50000) AS s
+LIMIT 50000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-50pct/256MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 50000 OFFSET 0;
+
+-- case: early-controls/cost-100-limit-75pct/64kB
+-- check: equivalent
+SET work_mem = '64kB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-100-limit-75pct/64kB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 75000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-75pct/64kB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 75000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-75pct/64kB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 75000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-75pct/64kB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 75000) AS s
+LIMIT 75000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-75pct/64kB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 75000 OFFSET 0;
+
+-- case: early-controls/cost-100-limit-75pct/4MB
+-- check: equivalent
+SET work_mem = '4MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-100-limit-75pct/4MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 75000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-75pct/4MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 75000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-75pct/4MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 75000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-75pct/4MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 75000) AS s
+LIMIT 75000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-75pct/4MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 75000 OFFSET 0;
+
+-- case: early-controls/cost-100-limit-75pct/256MB
+-- check: equivalent
+SET work_mem = '256MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-100-limit-75pct/256MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 75000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-75pct/256MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 75000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-75pct/256MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 75000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-75pct/256MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 75000) AS s
+LIMIT 75000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-75pct/256MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 75000 OFFSET 0;
+
+-- case: early-controls/cost-100-limit-100pct/64kB
+-- check: equivalent
+SET work_mem = '64kB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-100-limit-100pct/64kB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-100pct/64kB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-100pct/64kB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-100pct/64kB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 100000) AS s
+LIMIT 100000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-100pct/64kB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 100000 OFFSET 0;
+
+-- case: early-controls/cost-100-limit-100pct/4MB
+-- check: equivalent
+SET work_mem = '4MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-100-limit-100pct/4MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-100pct/4MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-100pct/4MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-100pct/4MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 100000) AS s
+LIMIT 100000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-100pct/4MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 100000 OFFSET 0;
+
+-- case: early-controls/cost-100-limit-100pct/256MB
+-- check: equivalent
+SET work_mem = '256MB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('early-controls/cost-100-limit-100pct/256MB', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-100pct/256MB', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('early-controls/cost-100-limit-100pct/256MB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-100pct/256MB', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_width_accurate
+      ORDER BY sort_key LIMIT 100000) AS s
+LIMIT 100000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('early-controls/cost-100-limit-100pct/256MB', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_100(octet_length(payload), 0, 0) AS e1
+FROM topnbench_width_accurate
+ORDER BY sort_key, e1
+LIMIT 100000 OFFSET 0;
+
+-- case: copy-width/width-8-limit-1pct
+-- check: equivalent
+SET work_mem = '1GB';
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-8-limit-1pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_8
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-8-limit-1pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_8
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-8-limit-1pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_8
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-8-limit-1pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_8
+      ORDER BY sort_key LIMIT 1000) AS s
+LIMIT 1000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-8-limit-1pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_8
+ORDER BY sort_key, e1
+LIMIT 1000 OFFSET 0;
+
+-- case: pure-sort/width-8-limit-1pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-8-limit-1pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_8
+ORDER BY sort_key LIMIT 1000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-8-limit-1pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_8
+ORDER BY sort_key LIMIT 1000;
+
+-- case: copy-width/width-8-limit-25pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-8-limit-25pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_8
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-8-limit-25pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_8
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-8-limit-25pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_8
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-8-limit-25pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_8
+      ORDER BY sort_key LIMIT 25000) AS s
+LIMIT 25000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-8-limit-25pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_8
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: pure-sort/width-8-limit-25pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-8-limit-25pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_8
+ORDER BY sort_key LIMIT 25000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-8-limit-25pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_8
+ORDER BY sort_key LIMIT 25000;
+
+-- case: copy-width/width-8-limit-50pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-8-limit-50pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_8
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-8-limit-50pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_8
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-8-limit-50pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_8
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-8-limit-50pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_8
+      ORDER BY sort_key LIMIT 50000) AS s
+LIMIT 50000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-8-limit-50pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_8
+ORDER BY sort_key, e1
+LIMIT 50000 OFFSET 0;
+
+-- case: pure-sort/width-8-limit-50pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-8-limit-50pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_8
+ORDER BY sort_key LIMIT 50000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-8-limit-50pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_8
+ORDER BY sort_key LIMIT 50000;
+
+-- case: copy-width/width-8-limit-100pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-8-limit-100pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_8
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-8-limit-100pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_8
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-8-limit-100pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_8
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-8-limit-100pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_8
+      ORDER BY sort_key LIMIT 100000) AS s
+LIMIT 100000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-8-limit-100pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_8
+ORDER BY sort_key, e1
+LIMIT 100000 OFFSET 0;
+
+-- case: pure-sort/width-8-limit-100pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-8-limit-100pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_8
+ORDER BY sort_key LIMIT 100000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-8-limit-100pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_8
+ORDER BY sort_key LIMIT 100000;
+
+-- case: copy-width/width-32-limit-1pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-32-limit-1pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_32
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-32-limit-1pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_32
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-32-limit-1pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_32
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-32-limit-1pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_32
+      ORDER BY sort_key LIMIT 1000) AS s
+LIMIT 1000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-32-limit-1pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_32
+ORDER BY sort_key, e1
+LIMIT 1000 OFFSET 0;
+
+-- case: pure-sort/width-32-limit-1pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-32-limit-1pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_32
+ORDER BY sort_key LIMIT 1000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-32-limit-1pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_32
+ORDER BY sort_key LIMIT 1000;
+
+-- case: copy-width/width-32-limit-25pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-32-limit-25pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_32
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-32-limit-25pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_32
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-32-limit-25pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_32
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-32-limit-25pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_32
+      ORDER BY sort_key LIMIT 25000) AS s
+LIMIT 25000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-32-limit-25pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_32
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: pure-sort/width-32-limit-25pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-32-limit-25pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_32
+ORDER BY sort_key LIMIT 25000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-32-limit-25pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_32
+ORDER BY sort_key LIMIT 25000;
+
+-- case: copy-width/width-32-limit-50pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-32-limit-50pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_32
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-32-limit-50pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_32
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-32-limit-50pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_32
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-32-limit-50pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_32
+      ORDER BY sort_key LIMIT 50000) AS s
+LIMIT 50000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-32-limit-50pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_32
+ORDER BY sort_key, e1
+LIMIT 50000 OFFSET 0;
+
+-- case: pure-sort/width-32-limit-50pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-32-limit-50pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_32
+ORDER BY sort_key LIMIT 50000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-32-limit-50pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_32
+ORDER BY sort_key LIMIT 50000;
+
+-- case: copy-width/width-32-limit-100pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-32-limit-100pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_32
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-32-limit-100pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_32
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-32-limit-100pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_32
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-32-limit-100pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_32
+      ORDER BY sort_key LIMIT 100000) AS s
+LIMIT 100000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-32-limit-100pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_32
+ORDER BY sort_key, e1
+LIMIT 100000 OFFSET 0;
+
+-- case: pure-sort/width-32-limit-100pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-32-limit-100pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_32
+ORDER BY sort_key LIMIT 100000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-32-limit-100pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_32
+ORDER BY sort_key LIMIT 100000;
+
+-- case: copy-width/width-128-limit-1pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-128-limit-1pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-128-limit-1pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-128-limit-1pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-128-limit-1pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 1000) AS s
+LIMIT 1000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-128-limit-1pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 1000 OFFSET 0;
+
+-- case: pure-sort/width-128-limit-1pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-128-limit-1pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_128
+ORDER BY sort_key LIMIT 1000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-128-limit-1pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_128
+ORDER BY sort_key LIMIT 1000;
+
+-- case: copy-width/width-128-limit-25pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-128-limit-25pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-128-limit-25pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-128-limit-25pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-128-limit-25pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 25000) AS s
+LIMIT 25000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-128-limit-25pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: pure-sort/width-128-limit-25pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-128-limit-25pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_128
+ORDER BY sort_key LIMIT 25000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-128-limit-25pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_128
+ORDER BY sort_key LIMIT 25000;
+
+-- case: copy-width/width-128-limit-50pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-128-limit-50pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-128-limit-50pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-128-limit-50pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-128-limit-50pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 50000) AS s
+LIMIT 50000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-128-limit-50pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 50000 OFFSET 0;
+
+-- case: pure-sort/width-128-limit-50pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-128-limit-50pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_128
+ORDER BY sort_key LIMIT 50000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-128-limit-50pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_128
+ORDER BY sort_key LIMIT 50000;
+
+-- case: copy-width/width-128-limit-100pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-128-limit-100pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-128-limit-100pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-128-limit-100pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-128-limit-100pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 100000) AS s
+LIMIT 100000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-128-limit-100pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 100000 OFFSET 0;
+
+-- case: pure-sort/width-128-limit-100pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-128-limit-100pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_128
+ORDER BY sort_key LIMIT 100000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-128-limit-100pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_128
+ORDER BY sort_key LIMIT 100000;
+
+-- case: copy-width/width-256-limit-1pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-256-limit-1pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-256-limit-1pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-256-limit-1pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-256-limit-1pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_256
+      ORDER BY sort_key LIMIT 1000) AS s
+LIMIT 1000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-256-limit-1pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key, e1
+LIMIT 1000 OFFSET 0;
+
+-- case: pure-sort/width-256-limit-1pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-256-limit-1pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_256
+ORDER BY sort_key LIMIT 1000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-256-limit-1pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_256
+ORDER BY sort_key LIMIT 1000;
+
+-- case: copy-width/width-256-limit-25pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-256-limit-25pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-256-limit-25pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-256-limit-25pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-256-limit-25pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_256
+      ORDER BY sort_key LIMIT 25000) AS s
+LIMIT 25000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-256-limit-25pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: pure-sort/width-256-limit-25pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-256-limit-25pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_256
+ORDER BY sort_key LIMIT 25000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-256-limit-25pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_256
+ORDER BY sort_key LIMIT 25000;
+
+-- case: copy-width/width-256-limit-50pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-256-limit-50pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-256-limit-50pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-256-limit-50pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-256-limit-50pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_256
+      ORDER BY sort_key LIMIT 50000) AS s
+LIMIT 50000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-256-limit-50pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key, e1
+LIMIT 50000 OFFSET 0;
+
+-- case: pure-sort/width-256-limit-50pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-256-limit-50pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_256
+ORDER BY sort_key LIMIT 50000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-256-limit-50pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_256
+ORDER BY sort_key LIMIT 50000;
+
+-- case: copy-width/width-256-limit-100pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-256-limit-100pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-256-limit-100pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-256-limit-100pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-256-limit-100pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_256
+      ORDER BY sort_key LIMIT 100000) AS s
+LIMIT 100000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-256-limit-100pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key, e1
+LIMIT 100000 OFFSET 0;
+
+-- case: pure-sort/width-256-limit-100pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-256-limit-100pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_256
+ORDER BY sort_key LIMIT 100000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-256-limit-100pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_256
+ORDER BY sort_key LIMIT 100000;
+
+-- case: copy-width/width-512-limit-1pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-512-limit-1pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_512
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-512-limit-1pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_512
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-512-limit-1pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_512
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-512-limit-1pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_512
+      ORDER BY sort_key LIMIT 1000) AS s
+LIMIT 1000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-512-limit-1pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_512
+ORDER BY sort_key, e1
+LIMIT 1000 OFFSET 0;
+
+-- case: pure-sort/width-512-limit-1pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-512-limit-1pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_512
+ORDER BY sort_key LIMIT 1000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-512-limit-1pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_512
+ORDER BY sort_key LIMIT 1000;
+
+-- case: copy-width/width-512-limit-25pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-512-limit-25pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_512
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-512-limit-25pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_512
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-512-limit-25pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_512
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-512-limit-25pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_512
+      ORDER BY sort_key LIMIT 25000) AS s
+LIMIT 25000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-512-limit-25pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_512
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: pure-sort/width-512-limit-25pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-512-limit-25pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_512
+ORDER BY sort_key LIMIT 25000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-512-limit-25pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_512
+ORDER BY sort_key LIMIT 25000;
+
+-- case: copy-width/width-512-limit-50pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-512-limit-50pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_512
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-512-limit-50pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_512
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-512-limit-50pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_512
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-512-limit-50pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_512
+      ORDER BY sort_key LIMIT 50000) AS s
+LIMIT 50000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-512-limit-50pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_512
+ORDER BY sort_key, e1
+LIMIT 50000 OFFSET 0;
+
+-- case: pure-sort/width-512-limit-50pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-512-limit-50pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_512
+ORDER BY sort_key LIMIT 50000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-512-limit-50pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_512
+ORDER BY sort_key LIMIT 50000;
+
+-- case: copy-width/width-512-limit-100pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-512-limit-100pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_512
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-512-limit-100pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_512
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-512-limit-100pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_512
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-512-limit-100pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_512
+      ORDER BY sort_key LIMIT 100000) AS s
+LIMIT 100000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-512-limit-100pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_512
+ORDER BY sort_key, e1
+LIMIT 100000 OFFSET 0;
+
+-- case: pure-sort/width-512-limit-100pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-512-limit-100pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_512
+ORDER BY sort_key LIMIT 100000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-512-limit-100pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_512
+ORDER BY sort_key LIMIT 100000;
+
+-- case: copy-width/width-1024-limit-1pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-1024-limit-1pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_1024
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-1024-limit-1pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_1024
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-1024-limit-1pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_1024
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-1024-limit-1pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_1024
+      ORDER BY sort_key LIMIT 1000) AS s
+LIMIT 1000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-1024-limit-1pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_1024
+ORDER BY sort_key, e1
+LIMIT 1000 OFFSET 0;
+
+-- case: pure-sort/width-1024-limit-1pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-1024-limit-1pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_1024
+ORDER BY sort_key LIMIT 1000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-1024-limit-1pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_1024
+ORDER BY sort_key LIMIT 1000;
+
+-- case: copy-width/width-1024-limit-25pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-1024-limit-25pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_1024
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-1024-limit-25pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_1024
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-1024-limit-25pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_1024
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-1024-limit-25pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_1024
+      ORDER BY sort_key LIMIT 25000) AS s
+LIMIT 25000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-1024-limit-25pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_1024
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: pure-sort/width-1024-limit-25pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-1024-limit-25pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_1024
+ORDER BY sort_key LIMIT 25000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-1024-limit-25pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_1024
+ORDER BY sort_key LIMIT 25000;
+
+-- case: copy-width/width-1024-limit-50pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-1024-limit-50pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_1024
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-1024-limit-50pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_1024
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-1024-limit-50pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_1024
+ORDER BY sort_key
+LIMIT 50000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-1024-limit-50pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_1024
+      ORDER BY sort_key LIMIT 50000) AS s
+LIMIT 50000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-1024-limit-50pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_1024
+ORDER BY sort_key, e1
+LIMIT 50000 OFFSET 0;
+
+-- case: pure-sort/width-1024-limit-50pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-1024-limit-50pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_1024
+ORDER BY sort_key LIMIT 50000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-1024-limit-50pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_1024
+ORDER BY sort_key LIMIT 50000;
+
+-- case: copy-width/width-1024-limit-100pct
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('copy-width/width-1024-limit-100pct', 'upstream-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_1024
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: plan
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('copy-width/width-1024-limit-100pct', 'path-only-auto', 'equivalent', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_1024
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('copy-width/width-1024-limit-100pct', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_1024
+ORDER BY sort_key
+LIMIT 100000 OFFSET 0;
+
+-- variant: manual-late
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-1024-limit-100pct', 'manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_1024
+      ORDER BY sort_key LIMIT 100000) AS s
+LIMIT 100000 OFFSET 0;
+
+-- variant: forced-early
+-- sample: timed
+SELECT topnbench_capture('copy-width/width-1024-limit-100pct', 'forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_1024
+ORDER BY sort_key, e1
+LIMIT 100000 OFFSET 0;
+
+-- case: pure-sort/width-1024-limit-100pct
+-- check: shape
+
+-- variant: narrow
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-1024-limit-100pct', 'narrow', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key FROM topnbench_copy_width_1024
+ORDER BY sort_key LIMIT 100000;
+
+-- variant: wide
+-- sample: timed
+SELECT topnbench_capture('pure-sort/width-1024-limit-100pct', 'wide', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key, payload FROM topnbench_copy_width_1024
+ORDER BY sort_key LIMIT 100000;
+
+-- case: final-cost/width-96-limit-25pct
+-- check: equivalent
+SET work_mem = '64MB';
+
+-- variant: total-off/auto
+-- sample: timed
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('final-cost/width-96-limit-25pct', 'total-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_96
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-96-limit-25pct', 'total-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_96
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-96-limit-25pct', 'total-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_96
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/auto
+-- sample: timed
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('final-cost/width-96-limit-25pct', 'total-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_96
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-96-limit-25pct', 'total-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_96
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-96-limit-25pct', 'total-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_96
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: datum-cost/width-96-limit-25pct
+-- check: equivalent
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-cost/width-96-limit-25pct', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_96
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-96-limit-25pct', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_96
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-96-limit-25pct', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_96
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-cost/width-96-limit-25pct', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_96
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-96-limit-25pct', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_96
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-96-limit-25pct', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_96
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: final-cost/width-128-limit-25pct
+-- check: equivalent
+
+-- variant: total-off/auto
+-- sample: timed
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('final-cost/width-128-limit-25pct', 'total-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-128-limit-25pct', 'total-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-128-limit-25pct', 'total-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/auto
+-- sample: timed
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('final-cost/width-128-limit-25pct', 'total-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-128-limit-25pct', 'total-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-128-limit-25pct', 'total-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: datum-cost/width-128-limit-25pct
+-- check: equivalent
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-cost/width-128-limit-25pct', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-128-limit-25pct', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-128-limit-25pct', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-cost/width-128-limit-25pct', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-128-limit-25pct', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-128-limit-25pct', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: final-cost/width-160-limit-25pct
+-- check: equivalent
+
+-- variant: total-off/auto
+-- sample: timed
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('final-cost/width-160-limit-25pct', 'total-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_160
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-160-limit-25pct', 'total-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_160
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-160-limit-25pct', 'total-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_160
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/auto
+-- sample: timed
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('final-cost/width-160-limit-25pct', 'total-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_160
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-160-limit-25pct', 'total-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_160
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-160-limit-25pct', 'total-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_160
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: datum-cost/width-160-limit-25pct
+-- check: equivalent
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-cost/width-160-limit-25pct', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_160
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-160-limit-25pct', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_160
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-160-limit-25pct', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_160
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-cost/width-160-limit-25pct', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_160
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-160-limit-25pct', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_160
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-160-limit-25pct', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_160
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: final-cost/width-192-limit-25pct
+-- check: equivalent
+
+-- variant: total-off/auto
+-- sample: timed
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('final-cost/width-192-limit-25pct', 'total-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_192
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-192-limit-25pct', 'total-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_192
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-192-limit-25pct', 'total-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_192
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/auto
+-- sample: timed
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('final-cost/width-192-limit-25pct', 'total-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_192
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-192-limit-25pct', 'total-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_192
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-192-limit-25pct', 'total-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_192
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: datum-cost/width-192-limit-25pct
+-- check: equivalent
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-cost/width-192-limit-25pct', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_192
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-192-limit-25pct', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_192
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-192-limit-25pct', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_192
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-cost/width-192-limit-25pct', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_192
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-192-limit-25pct', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_192
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-192-limit-25pct', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_192
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: final-cost/width-256-limit-25pct
+-- check: equivalent
+
+-- variant: total-off/auto
+-- sample: timed
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('final-cost/width-256-limit-25pct', 'total-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-256-limit-25pct', 'total-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_256
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-256-limit-25pct', 'total-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/auto
+-- sample: timed
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('final-cost/width-256-limit-25pct', 'total-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-256-limit-25pct', 'total-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_256
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-256-limit-25pct', 'total-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: datum-cost/width-256-limit-25pct
+-- check: equivalent
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-cost/width-256-limit-25pct', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-256-limit-25pct', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_256
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-256-limit-25pct', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-cost/width-256-limit-25pct', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-256-limit-25pct', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_256
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-256-limit-25pct', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: final-cost/width-128-limit-20pct
+-- check: equivalent
+
+-- variant: total-off/auto
+-- sample: timed
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('final-cost/width-128-limit-20pct', 'total-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 20000 OFFSET 0;
+
+-- variant: total-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-128-limit-20pct', 'total-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 20000) AS s
+ORDER BY s.k
+LIMIT 20000 OFFSET 0;
+
+-- variant: total-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-128-limit-20pct', 'total-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 20000 OFFSET 0;
+
+-- variant: total-on/auto
+-- sample: timed
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('final-cost/width-128-limit-20pct', 'total-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 20000 OFFSET 0;
+
+-- variant: total-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-128-limit-20pct', 'total-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 20000) AS s
+ORDER BY s.k
+LIMIT 20000 OFFSET 0;
+
+-- variant: total-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-128-limit-20pct', 'total-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 20000 OFFSET 0;
+
+-- case: datum-cost/width-128-limit-20pct
+-- check: equivalent
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-cost/width-128-limit-20pct', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 20000 OFFSET 0;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-128-limit-20pct', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 20000) AS s
+ORDER BY s.k
+LIMIT 20000 OFFSET 0;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-128-limit-20pct', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 20000 OFFSET 0;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-cost/width-128-limit-20pct', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 20000 OFFSET 0;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-128-limit-20pct', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 20000) AS s
+ORDER BY s.k
+LIMIT 20000 OFFSET 0;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-128-limit-20pct', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 20000 OFFSET 0;
+
+-- case: final-cost/width-128-limit-30pct
+-- check: equivalent
+
+-- variant: total-off/auto
+-- sample: timed
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('final-cost/width-128-limit-30pct', 'total-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 30000 OFFSET 0;
+
+-- variant: total-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-128-limit-30pct', 'total-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 30000) AS s
+ORDER BY s.k
+LIMIT 30000 OFFSET 0;
+
+-- variant: total-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-128-limit-30pct', 'total-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 30000 OFFSET 0;
+
+-- variant: total-on/auto
+-- sample: timed
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('final-cost/width-128-limit-30pct', 'total-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 30000 OFFSET 0;
+
+-- variant: total-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-128-limit-30pct', 'total-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 30000) AS s
+ORDER BY s.k
+LIMIT 30000 OFFSET 0;
+
+-- variant: total-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/width-128-limit-30pct', 'total-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 30000 OFFSET 0;
+
+-- case: datum-cost/width-128-limit-30pct
+-- check: equivalent
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-cost/width-128-limit-30pct', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 30000 OFFSET 0;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-128-limit-30pct', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 30000) AS s
+ORDER BY s.k
+LIMIT 30000 OFFSET 0;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-128-limit-30pct', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 30000 OFFSET 0;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-cost/width-128-limit-30pct', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 30000 OFFSET 0;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-128-limit-30pct', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 30000) AS s
+ORDER BY s.k
+LIMIT 30000 OFFSET 0;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/width-128-limit-30pct', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 30000 OFFSET 0;
+
+-- case: final-cost/offset-half-of-25pct
+-- check: equivalent
+
+-- variant: total-off/auto
+-- sample: timed
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('final-cost/offset-half-of-25pct', 'total-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 12500 OFFSET 12500;
+
+-- variant: total-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/offset-half-of-25pct', 'total-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 12500 OFFSET 12500;
+
+-- variant: total-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/offset-half-of-25pct', 'total-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 12500 OFFSET 12500;
+
+-- variant: total-on/auto
+-- sample: timed
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('final-cost/offset-half-of-25pct', 'total-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 12500 OFFSET 12500;
+
+-- variant: total-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/offset-half-of-25pct', 'total-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 12500 OFFSET 12500;
+
+-- variant: total-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/offset-half-of-25pct', 'total-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 12500 OFFSET 12500;
+
+-- case: datum-cost/offset-half-of-25pct
+-- check: equivalent
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-cost/offset-half-of-25pct', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 12500 OFFSET 12500;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/offset-half-of-25pct', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 12500 OFFSET 12500;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/offset-half-of-25pct', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 12500 OFFSET 12500;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-cost/offset-half-of-25pct', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 12500 OFFSET 12500;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/offset-half-of-25pct', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 12500 OFFSET 12500;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/offset-half-of-25pct', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 12500 OFFSET 12500;
+
+-- case: final-cost/offset-most-of-25pct
+-- check: equivalent
+
+-- variant: total-off/auto
+-- sample: timed
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('final-cost/offset-most-of-25pct', 'total-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 1000 OFFSET 24000;
+
+-- variant: total-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/offset-most-of-25pct', 'total-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 1000 OFFSET 24000;
+
+-- variant: total-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/offset-most-of-25pct', 'total-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 1000 OFFSET 24000;
+
+-- variant: total-on/auto
+-- sample: timed
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('final-cost/offset-most-of-25pct', 'total-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 1000 OFFSET 24000;
+
+-- variant: total-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/offset-most-of-25pct', 'total-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 1000 OFFSET 24000;
+
+-- variant: total-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/offset-most-of-25pct', 'total-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 1000 OFFSET 24000;
+
+-- case: datum-cost/offset-most-of-25pct
+-- check: equivalent
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-cost/offset-most-of-25pct', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 1000 OFFSET 24000;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/offset-most-of-25pct', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 1000 OFFSET 24000;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/offset-most-of-25pct', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 1000 OFFSET 24000;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-cost/offset-most-of-25pct', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 1000 OFFSET 24000;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/offset-most-of-25pct', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 1000 OFFSET 24000;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/offset-most-of-25pct', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 1000 OFFSET 24000;
+
+-- case: final-cost/expensive-limit-1pct
+-- check: equivalent
+
+-- variant: total-off/auto
+-- sample: timed
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('final-cost/expensive-limit-1pct', 'total-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 128, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: total-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/expensive-limit-1pct', 'total-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 128, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_256
+      ORDER BY sort_key LIMIT 1000) AS s
+ORDER BY s.k
+LIMIT 1000 OFFSET 0;
+
+-- variant: total-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/expensive-limit-1pct', 'total-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 128, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key, e1
+LIMIT 1000 OFFSET 0;
+
+-- variant: total-on/auto
+-- sample: timed
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('final-cost/expensive-limit-1pct', 'total-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 128, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: total-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/expensive-limit-1pct', 'total-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 128, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_256
+      ORDER BY sort_key LIMIT 1000) AS s
+ORDER BY s.k
+LIMIT 1000 OFFSET 0;
+
+-- variant: total-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/expensive-limit-1pct', 'total-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 128, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key, e1
+LIMIT 1000 OFFSET 0;
+
+-- case: datum-cost/expensive-limit-1pct
+-- check: equivalent
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-cost/expensive-limit-1pct', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 128, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/expensive-limit-1pct', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 128, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_256
+      ORDER BY sort_key LIMIT 1000) AS s
+ORDER BY s.k
+LIMIT 1000 OFFSET 0;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/expensive-limit-1pct', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 128, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key, e1
+LIMIT 1000 OFFSET 0;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-cost/expensive-limit-1pct', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 128, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 1000 OFFSET 0;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/expensive-limit-1pct', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 128, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_256
+      ORDER BY sort_key LIMIT 1000) AS s
+ORDER BY s.k
+LIMIT 1000 OFFSET 0;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/expensive-limit-1pct', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 128, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key, e1
+LIMIT 1000 OFFSET 0;
+
+-- case: final-cost/parallel-width-128
+-- check: equivalent
+SET max_parallel_workers_per_gather = 2;
+
+-- variant: total-off/auto
+-- sample: timed
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('final-cost/parallel-width-128', 'total-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/parallel-width-128', 'total-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/parallel-width-128', 'total-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/auto
+-- sample: timed
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('final-cost/parallel-width-128', 'total-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/parallel-width-128', 'total-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/parallel-width-128', 'total-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: datum-cost/parallel-width-128
+-- check: equivalent
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-cost/parallel-width-128', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/parallel-width-128', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/parallel-width-128', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-cost/parallel-width-128', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/parallel-width-128', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_128
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/parallel-width-128', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: final-cost/parallel-width-256
+-- check: equivalent
+
+-- variant: total-off/auto
+-- sample: timed
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('final-cost/parallel-width-256', 'total-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/parallel-width-256', 'total-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_256
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/parallel-width-256', 'total-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/auto
+-- sample: timed
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('final-cost/parallel-width-256', 'total-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/parallel-width-256', 'total-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_256
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: total-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/parallel-width-256', 'total-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: datum-cost/parallel-width-256
+-- check: equivalent
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-cost/parallel-width-256', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/parallel-width-256', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_256
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/parallel-width-256', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-cost/parallel-width-256', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/parallel-width-256', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM (SELECT sort_key AS k, payload FROM topnbench_copy_width_256
+      ORDER BY sort_key LIMIT 25000) AS s
+ORDER BY s.k
+LIMIT 25000 OFFSET 0;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/parallel-width-256', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key, e1
+LIMIT 25000 OFFSET 0;
+
+-- case: final-cost/cost-1-work-1
+-- check: equivalent
+SET max_parallel_workers_per_gather = 0;
+SET work_mem = '4MB';
+
+-- variant: total-off/auto
+-- sample: timed
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('final-cost/cost-1-work-1', 'total-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: total-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/cost-1-work-1', 'total-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 1, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: total-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/cost-1-work-1', 'total-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- variant: total-on/auto
+-- sample: timed
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('final-cost/cost-1-work-1', 'total-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: total-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/cost-1-work-1', 'total-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 1, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: total-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/cost-1-work-1', 'total-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: datum-cost/cost-1-work-1
+-- check: equivalent
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-cost/cost-1-work-1', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/cost-1-work-1', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 1, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/cost-1-work-1', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-cost/cost-1-work-1', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/cost-1-work-1', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 1, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/cost-1-work-1', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 1, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: final-cost/cost-1-work-16
+-- check: equivalent
+
+-- variant: total-off/auto
+-- sample: timed
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('final-cost/cost-1-work-16', 'total-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: total-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/cost-1-work-16', 'total-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: total-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/cost-1-work-16', 'total-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- variant: total-on/auto
+-- sample: timed
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('final-cost/cost-1-work-16', 'total-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: total-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/cost-1-work-16', 'total-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: total-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/cost-1-work-16', 'total-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: datum-cost/cost-1-work-16
+-- check: equivalent
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-cost/cost-1-work-16', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/cost-1-work-16', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/cost-1-work-16', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-cost/cost-1-work-16', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/cost-1-work-16', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/cost-1-work-16', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: final-cost/cost-1-work-64
+-- check: equivalent
+
+-- variant: total-off/auto
+-- sample: timed
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('final-cost/cost-1-work-64', 'total-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: total-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/cost-1-work-64', 'total-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 64, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: total-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/cost-1-work-64', 'total-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- variant: total-on/auto
+-- sample: timed
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('final-cost/cost-1-work-64', 'total-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: total-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/cost-1-work-64', 'total-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 64, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: total-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/cost-1-work-64', 'total-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: datum-cost/cost-1-work-64
+-- check: equivalent
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-cost/cost-1-work-64', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/cost-1-work-64', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 64, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/cost-1-work-64', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-cost/cost-1-work-64', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/cost-1-work-64', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 64, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/cost-1-work-64', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 64, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: final-cost/limit-90pct
+-- check: equivalent
+
+-- variant: total-off/auto
+-- sample: timed
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('final-cost/limit-90pct', 'total-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: total-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/limit-90pct', 'total-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 900000) AS s
+LIMIT 900000;
+
+-- variant: total-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/limit-90pct', 'total-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 900000;
+
+-- variant: total-on/auto
+-- sample: timed
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('final-cost/limit-90pct', 'total-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: total-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('final-cost/limit-90pct', 'total-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 900000) AS s
+LIMIT 900000;
+
+-- variant: total-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('final-cost/limit-90pct', 'total-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 900000;
+
+-- case: datum-cost/limit-90pct
+-- check: equivalent
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-cost/limit-90pct', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/limit-90pct', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 900000) AS s
+LIMIT 900000;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/limit-90pct', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 900000;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-cost/limit-90pct', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('datum-cost/limit-90pct', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 900000) AS s
+LIMIT 900000;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('datum-cost/limit-90pct', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 900000;
+
+-- case: representation/limit-250000/4MB
+-- check: shape
+
+-- variant: scan-one
+-- sample: timed
+SELECT topnbench_capture('representation/limit-250000/4MB', 'scan-one', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random FROM topnbench_data;
+
+-- variant: scan-two
+-- sample: timed
+SELECT topnbench_capture('representation/limit-250000/4MB', 'scan-two', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random, same1 FROM topnbench_data;
+
+-- variant: sort-datum
+-- sample: timed
+SELECT topnbench_capture('representation/limit-250000/4MB', 'sort-datum', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random FROM topnbench_data
+ORDER BY a_random LIMIT 250000;
+
+-- variant: sort-tuple
+-- sample: timed
+SELECT topnbench_capture('representation/limit-250000/4MB', 'sort-tuple', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random, same1 FROM topnbench_data
+ORDER BY a_random LIMIT 250000;
+
+-- variant: late-work-0
+-- sample: timed
+SELECT topnbench_capture('representation/limit-250000/4MB', 'late-work-0', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random, topnbench_work_cost_100(a_random, 0, 1) AS e1
+FROM topnbench_data ORDER BY a_random LIMIT 250000;
+
+-- variant: late-work-16
+-- sample: timed
+SELECT topnbench_capture('representation/limit-250000/4MB', 'late-work-16', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random, topnbench_work_cost_100(a_random, 16, 1) AS e1
+FROM topnbench_data ORDER BY a_random LIMIT 250000;
+
+-- case: representation/limit-250000/256MB
+-- check: shape
+SET work_mem = '256MB';
+
+-- variant: scan-one
+-- sample: timed
+SELECT topnbench_capture('representation/limit-250000/256MB', 'scan-one', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random FROM topnbench_data;
+
+-- variant: scan-two
+-- sample: timed
+SELECT topnbench_capture('representation/limit-250000/256MB', 'scan-two', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random, same1 FROM topnbench_data;
+
+-- variant: sort-datum
+-- sample: timed
+SELECT topnbench_capture('representation/limit-250000/256MB', 'sort-datum', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random FROM topnbench_data
+ORDER BY a_random LIMIT 250000;
+
+-- variant: sort-tuple
+-- sample: timed
+SELECT topnbench_capture('representation/limit-250000/256MB', 'sort-tuple', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random, same1 FROM topnbench_data
+ORDER BY a_random LIMIT 250000;
+
+-- variant: late-work-0
+-- sample: timed
+SELECT topnbench_capture('representation/limit-250000/256MB', 'late-work-0', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random, topnbench_work_cost_100(a_random, 0, 1) AS e1
+FROM topnbench_data ORDER BY a_random LIMIT 250000;
+
+-- variant: late-work-16
+-- sample: timed
+SELECT topnbench_capture('representation/limit-250000/256MB', 'late-work-16', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random, topnbench_work_cost_100(a_random, 16, 1) AS e1
+FROM topnbench_data ORDER BY a_random LIMIT 250000;
+
+-- case: representation/limit-900000/4MB
+-- check: shape
+SET work_mem = '4MB';
+
+-- variant: scan-one
+-- sample: timed
+SELECT topnbench_capture('representation/limit-900000/4MB', 'scan-one', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random FROM topnbench_data;
+
+-- variant: scan-two
+-- sample: timed
+SELECT topnbench_capture('representation/limit-900000/4MB', 'scan-two', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random, same1 FROM topnbench_data;
+
+-- variant: sort-datum
+-- sample: timed
+SELECT topnbench_capture('representation/limit-900000/4MB', 'sort-datum', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random FROM topnbench_data
+ORDER BY a_random LIMIT 900000;
+
+-- variant: sort-tuple
+-- sample: timed
+SELECT topnbench_capture('representation/limit-900000/4MB', 'sort-tuple', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random, same1 FROM topnbench_data
+ORDER BY a_random LIMIT 900000;
+
+-- variant: late-work-0
+-- sample: timed
+SELECT topnbench_capture('representation/limit-900000/4MB', 'late-work-0', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random, topnbench_work_cost_100(a_random, 0, 1) AS e1
+FROM topnbench_data ORDER BY a_random LIMIT 900000;
+
+-- variant: late-work-16
+-- sample: timed
+SELECT topnbench_capture('representation/limit-900000/4MB', 'late-work-16', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random, topnbench_work_cost_100(a_random, 16, 1) AS e1
+FROM topnbench_data ORDER BY a_random LIMIT 900000;
+
+-- case: representation/limit-900000/256MB
+-- check: shape
+SET work_mem = '256MB';
+
+-- variant: scan-one
+-- sample: timed
+SELECT topnbench_capture('representation/limit-900000/256MB', 'scan-one', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random FROM topnbench_data;
+
+-- variant: scan-two
+-- sample: timed
+SELECT topnbench_capture('representation/limit-900000/256MB', 'scan-two', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random, same1 FROM topnbench_data;
+
+-- variant: sort-datum
+-- sample: timed
+SELECT topnbench_capture('representation/limit-900000/256MB', 'sort-datum', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random FROM topnbench_data
+ORDER BY a_random LIMIT 900000;
+
+-- variant: sort-tuple
+-- sample: timed
+SELECT topnbench_capture('representation/limit-900000/256MB', 'sort-tuple', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random, same1 FROM topnbench_data
+ORDER BY a_random LIMIT 900000;
+
+-- variant: late-work-0
+-- sample: timed
+SELECT topnbench_capture('representation/limit-900000/256MB', 'late-work-0', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random, topnbench_work_cost_100(a_random, 0, 1) AS e1
+FROM topnbench_data ORDER BY a_random LIMIT 900000;
+
+-- variant: late-work-16
+-- sample: timed
+SELECT topnbench_capture('representation/limit-900000/256MB', 'late-work-16', 'shape', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random, topnbench_work_cost_100(a_random, 16, 1) AS e1
+FROM topnbench_data ORDER BY a_random LIMIT 900000;
+
+-- case: boundary/cost-1-work-16/4MB
+-- check: equivalent
+SET work_mem = '4MB';
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('boundary/cost-1-work-16/4MB', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/4MB', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/4MB', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('boundary/cost-1-work-16/4MB', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/4MB', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/4MB', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: algorithm/cost-1-work-16/4MB
+-- check: algorithm
+
+-- variant: default/auto
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/4MB', 'default/auto', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: default/manual-late
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/4MB', 'default/manual-late', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: default/forced-early
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/4MB', 'default/forced-early', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- variant: radix-disabled/auto
+-- sample: timed
+SET debug_disable_sort_radix = on;
+SELECT topnbench_capture('algorithm/cost-1-work-16/4MB', 'radix-disabled/auto', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: radix-disabled/manual-late
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/4MB', 'radix-disabled/manual-late', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: radix-disabled/forced-early
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/4MB', 'radix-disabled/forced-early', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: boundary/cost-1-work-16/8MB
+-- check: equivalent
+SET debug_disable_sort_radix = off;
+SET work_mem = '8MB';
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('boundary/cost-1-work-16/8MB', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/8MB', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/8MB', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('boundary/cost-1-work-16/8MB', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/8MB', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/8MB', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: boundary/cost-1-work-16/16MB
+-- check: equivalent
+SET work_mem = '16MB';
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('boundary/cost-1-work-16/16MB', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/16MB', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/16MB', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('boundary/cost-1-work-16/16MB', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/16MB', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/16MB', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: algorithm/cost-1-work-16/16MB
+-- check: algorithm
+
+-- variant: default/auto
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/16MB', 'default/auto', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: default/manual-late
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/16MB', 'default/manual-late', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: default/forced-early
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/16MB', 'default/forced-early', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- variant: radix-disabled/auto
+-- sample: timed
+SET debug_disable_sort_radix = on;
+SELECT topnbench_capture('algorithm/cost-1-work-16/16MB', 'radix-disabled/auto', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: radix-disabled/manual-late
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/16MB', 'radix-disabled/manual-late', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: radix-disabled/forced-early
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/16MB', 'radix-disabled/forced-early', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: boundary/cost-1-work-16/24MB
+-- check: equivalent
+SET debug_disable_sort_radix = off;
+SET work_mem = '24MB';
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('boundary/cost-1-work-16/24MB', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/24MB', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/24MB', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('boundary/cost-1-work-16/24MB', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/24MB', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/24MB', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: algorithm/cost-1-work-16/24MB
+-- check: algorithm
+
+-- variant: default/auto
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/24MB', 'default/auto', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: default/manual-late
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/24MB', 'default/manual-late', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: default/forced-early
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/24MB', 'default/forced-early', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- variant: radix-disabled/auto
+-- sample: timed
+SET debug_disable_sort_radix = on;
+SELECT topnbench_capture('algorithm/cost-1-work-16/24MB', 'radix-disabled/auto', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: radix-disabled/manual-late
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/24MB', 'radix-disabled/manual-late', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: radix-disabled/forced-early
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/24MB', 'radix-disabled/forced-early', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: boundary/cost-1-work-16/32MB
+-- check: equivalent
+SET debug_disable_sort_radix = off;
+SET work_mem = '32MB';
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('boundary/cost-1-work-16/32MB', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/32MB', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/32MB', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('boundary/cost-1-work-16/32MB', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/32MB', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/32MB', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: algorithm/cost-1-work-16/32MB
+-- check: algorithm
+
+-- variant: default/auto
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/32MB', 'default/auto', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: default/manual-late
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/32MB', 'default/manual-late', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: default/forced-early
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/32MB', 'default/forced-early', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- variant: radix-disabled/auto
+-- sample: timed
+SET debug_disable_sort_radix = on;
+SELECT topnbench_capture('algorithm/cost-1-work-16/32MB', 'radix-disabled/auto', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: radix-disabled/manual-late
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/32MB', 'radix-disabled/manual-late', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: radix-disabled/forced-early
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/32MB', 'radix-disabled/forced-early', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: boundary/cost-1-work-16/256MB
+-- check: equivalent
+SET debug_disable_sort_radix = off;
+SET work_mem = '256MB';
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('boundary/cost-1-work-16/256MB', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/256MB', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/256MB', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('boundary/cost-1-work-16/256MB', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/256MB', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/cost-1-work-16/256MB', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: algorithm/cost-1-work-16/256MB
+-- check: algorithm
+
+-- variant: default/auto
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/256MB', 'default/auto', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: default/manual-late
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/256MB', 'default/manual-late', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: default/forced-early
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/256MB', 'default/forced-early', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- variant: radix-disabled/auto
+-- sample: timed
+SET debug_disable_sort_radix = on;
+SELECT topnbench_capture('algorithm/cost-1-work-16/256MB', 'radix-disabled/auto', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: radix-disabled/manual-late
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/256MB', 'radix-disabled/manual-late', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 16, 1) AS e1
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 250000) AS s
+LIMIT 250000;
+
+-- variant: radix-disabled/forced-early
+-- sample: timed
+SELECT topnbench_capture('algorithm/cost-1-work-16/256MB', 'radix-disabled/forced-early', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random, e1
+LIMIT 250000;
+
+-- case: boundary/limit-90pct/4MB
+-- check: equivalent
+SET debug_disable_sort_radix = off;
+SET work_mem = '4MB';
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('boundary/limit-90pct/4MB', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/4MB', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 900000) AS s
+LIMIT 900000;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/4MB', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 900000;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('boundary/limit-90pct/4MB', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/4MB', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 900000) AS s
+LIMIT 900000;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/4MB', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 900000;
+
+-- case: boundary/limit-90pct/8MB
+-- check: equivalent
+SET work_mem = '8MB';
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('boundary/limit-90pct/8MB', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/8MB', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 900000) AS s
+LIMIT 900000;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/8MB', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 900000;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('boundary/limit-90pct/8MB', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/8MB', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 900000) AS s
+LIMIT 900000;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/8MB', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 900000;
+
+-- case: boundary/limit-90pct/16MB
+-- check: equivalent
+SET work_mem = '16MB';
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('boundary/limit-90pct/16MB', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/16MB', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 900000) AS s
+LIMIT 900000;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/16MB', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 900000;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('boundary/limit-90pct/16MB', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/16MB', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 900000) AS s
+LIMIT 900000;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/16MB', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 900000;
+
+-- case: boundary/limit-90pct/24MB
+-- check: equivalent
+SET work_mem = '24MB';
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('boundary/limit-90pct/24MB', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/24MB', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 900000) AS s
+LIMIT 900000;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/24MB', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 900000;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('boundary/limit-90pct/24MB', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/24MB', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 900000) AS s
+LIMIT 900000;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/24MB', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 900000;
+
+-- case: boundary/limit-90pct/32MB
+-- check: equivalent
+SET work_mem = '32MB';
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('boundary/limit-90pct/32MB', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/32MB', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 900000) AS s
+LIMIT 900000;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/32MB', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 900000;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('boundary/limit-90pct/32MB', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/32MB', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 900000) AS s
+LIMIT 900000;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/32MB', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 900000;
+
+-- case: boundary/limit-90pct/256MB
+-- check: equivalent
+SET work_mem = '256MB';
+
+-- variant: datum-off/auto
+-- sample: timed
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('boundary/limit-90pct/256MB', 'datum-off/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: datum-off/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/256MB', 'datum-off/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 900000) AS s
+LIMIT 900000;
+
+-- variant: datum-off/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/256MB', 'datum-off/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 900000;
+
+-- variant: datum-on/auto
+-- sample: timed
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('boundary/limit-90pct/256MB', 'datum-on/auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: datum-on/manual-late
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/256MB', 'datum-on/manual-late', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 900000) AS s
+LIMIT 900000;
+
+-- variant: datum-on/forced-early
+-- sample: timed
+SELECT topnbench_capture('boundary/limit-90pct/256MB', 'datum-on/forced-early', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 900000;
+
+-- case: algorithm/limit-90pct/256MB
+-- check: algorithm
+
+-- variant: default/auto
+-- sample: timed
+SELECT topnbench_capture('algorithm/limit-90pct/256MB', 'default/auto', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: default/manual-late
+-- sample: timed
+SELECT topnbench_capture('algorithm/limit-90pct/256MB', 'default/manual-late', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 900000) AS s
+LIMIT 900000;
+
+-- variant: default/forced-early
+-- sample: timed
+SELECT topnbench_capture('algorithm/limit-90pct/256MB', 'default/forced-early', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 900000;
+
+-- variant: radix-disabled/auto
+-- sample: timed
+SET debug_disable_sort_radix = on;
+SELECT topnbench_capture('algorithm/limit-90pct/256MB', 'radix-disabled/auto', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: radix-disabled/manual-late
+-- sample: timed
+SELECT topnbench_capture('algorithm/limit-90pct/256MB', 'radix-disabled/manual-late', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT s.k,
+       topnbench_work_cost_1(s.k, 4, 1) AS e1,
+       topnbench_work_cost_1(s.k, 4, 2) AS e2,
+       topnbench_work_cost_1(s.k, 4, 3) AS e3,
+       topnbench_work_cost_1(s.k, 4, 4) AS e4
+FROM (SELECT a_random AS k FROM topnbench_data
+      ORDER BY a_random LIMIT 900000) AS s
+LIMIT 900000;
+
+-- variant: radix-disabled/forced-early
+-- sample: timed
+SELECT topnbench_capture('algorithm/limit-90pct/256MB', 'radix-disabled/forced-early', 'algorithm', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random, e1, e2, e3, e4
+LIMIT 900000;
+
+-- case: regression/stale-width-256kB
+-- check: equivalent
+SET debug_disable_sort_radix = off;
+SET work_mem = '256kB';
+
+-- variant: upstream-auto
+-- sample: timed
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('regression/stale-width-256kB', 'upstream-auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: timed
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('regression/stale-width-256kB', 'path-only-auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('regression/stale-width-256kB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_underestimate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- case: regression/accurate-width-256kB
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: timed
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('regression/accurate-width-256kB', 'upstream-auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: timed
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('regression/accurate-width-256kB', 'path-only-auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('regression/accurate-width-256kB', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a AS k, length(payload) AS e1
+FROM topnbench_width_accurate
+ORDER BY a
+LIMIT 5000 OFFSET 0;
+
+-- case: regression/copy-width-128-limit25
+-- check: equivalent
+SET work_mem = '1GB';
+
+-- variant: upstream-auto
+-- sample: timed
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('regression/copy-width-128-limit25', 'upstream-auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: timed
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('regression/copy-width-128-limit25', 'path-only-auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('regression/copy-width-128-limit25', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- case: regression/copy-width-256-limit25
+-- check: equivalent
+
+-- variant: upstream-auto
+-- sample: timed
+SET enable_cost_based_delayed_projection = off;
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('regression/copy-width-256-limit25', 'upstream-auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: path-only-auto
+-- sample: timed
+SET enable_cost_based_delayed_projection = on;
+SELECT topnbench_capture('regression/copy-width-256-limit25', 'path-only-auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- variant: auto
+-- sample: timed
+SET enable_sort_tuple_width_cost = on;
+SELECT topnbench_capture('regression/copy-width-256-limit25', 'auto', 'equivalent', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_256
+ORDER BY sort_key
+LIMIT 25000 OFFSET 0;
+
+-- case: same-query/cost-1-work-16/4MB
+-- check: same-query
+SET work_mem = '4MB';
+
+-- variant: auto
+-- sample: timed
+SELECT topnbench_capture('same-query/cost-1-work-16/4MB', 'auto', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: early
+-- sample: timed
+SET debug_projection_placement = early;
+SELECT topnbench_capture('same-query/cost-1-work-16/4MB', 'early', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: late
+-- sample: timed
+SET debug_projection_placement = late;
+SELECT topnbench_capture('same-query/cost-1-work-16/4MB', 'late', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- case: same-query/cost-1-work-16/8MB
+-- check: same-query
+SET debug_projection_placement = auto;
+SET work_mem = '8MB';
+
+-- variant: auto
+-- sample: timed
+SELECT topnbench_capture('same-query/cost-1-work-16/8MB', 'auto', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: early
+-- sample: timed
+SET debug_projection_placement = early;
+SELECT topnbench_capture('same-query/cost-1-work-16/8MB', 'early', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: late
+-- sample: timed
+SET debug_projection_placement = late;
+SELECT topnbench_capture('same-query/cost-1-work-16/8MB', 'late', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- case: same-query/cost-1-work-16/16MB
+-- check: same-query
+SET debug_projection_placement = auto;
+SET work_mem = '16MB';
+
+-- variant: auto
+-- sample: timed
+SELECT topnbench_capture('same-query/cost-1-work-16/16MB', 'auto', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: early
+-- sample: timed
+SET debug_projection_placement = early;
+SELECT topnbench_capture('same-query/cost-1-work-16/16MB', 'early', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: late
+-- sample: timed
+SET debug_projection_placement = late;
+SELECT topnbench_capture('same-query/cost-1-work-16/16MB', 'late', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- case: same-query/cost-1-work-16/24MB
+-- check: same-query
+SET debug_projection_placement = auto;
+SET work_mem = '24MB';
+
+-- variant: auto
+-- sample: timed
+SELECT topnbench_capture('same-query/cost-1-work-16/24MB', 'auto', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: early
+-- sample: timed
+SET debug_projection_placement = early;
+SELECT topnbench_capture('same-query/cost-1-work-16/24MB', 'early', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: late
+-- sample: timed
+SET debug_projection_placement = late;
+SELECT topnbench_capture('same-query/cost-1-work-16/24MB', 'late', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- case: same-query/cost-1-work-16/32MB
+-- check: same-query
+SET debug_projection_placement = auto;
+SET work_mem = '32MB';
+
+-- variant: auto
+-- sample: timed
+SELECT topnbench_capture('same-query/cost-1-work-16/32MB', 'auto', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: early
+-- sample: timed
+SET debug_projection_placement = early;
+SELECT topnbench_capture('same-query/cost-1-work-16/32MB', 'early', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: late
+-- sample: timed
+SET debug_projection_placement = late;
+SELECT topnbench_capture('same-query/cost-1-work-16/32MB', 'late', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- case: same-query/cost-1-work-16/256MB
+-- check: same-query
+SET debug_projection_placement = auto;
+SET work_mem = '256MB';
+
+-- variant: auto
+-- sample: timed
+SELECT topnbench_capture('same-query/cost-1-work-16/256MB', 'auto', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: early
+-- sample: timed
+SET debug_projection_placement = early;
+SELECT topnbench_capture('same-query/cost-1-work-16/256MB', 'early', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: late
+-- sample: timed
+SET debug_projection_placement = late;
+SELECT topnbench_capture('same-query/cost-1-work-16/256MB', 'late', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- case: same-query/cost-1-work-16/1GB
+-- check: same-query
+SET debug_projection_placement = auto;
+SET work_mem = '1GB';
+
+-- variant: auto
+-- sample: timed
+SELECT topnbench_capture('same-query/cost-1-work-16/1GB', 'auto', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: early
+-- sample: timed
+SET debug_projection_placement = early;
+SELECT topnbench_capture('same-query/cost-1-work-16/1GB', 'early', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- variant: late
+-- sample: timed
+SET debug_projection_placement = late;
+SELECT topnbench_capture('same-query/cost-1-work-16/1GB', 'late', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 16, 1) AS e1
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 250000;
+
+-- case: same-query/limit-90pct/256MB
+-- check: same-query
+SET debug_projection_placement = auto;
+SET work_mem = '256MB';
+
+-- variant: auto
+-- sample: timed
+SELECT topnbench_capture('same-query/limit-90pct/256MB', 'auto', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: early
+-- sample: timed
+SET debug_projection_placement = early;
+SELECT topnbench_capture('same-query/limit-90pct/256MB', 'early', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- variant: late
+-- sample: timed
+SET debug_projection_placement = late;
+SELECT topnbench_capture('same-query/limit-90pct/256MB', 'late', 'same-query', 'timed');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT a_random AS k,
+       topnbench_work_cost_1(a_random, 4, 1) AS e1,
+       topnbench_work_cost_1(a_random, 4, 2) AS e2,
+       topnbench_work_cost_1(a_random, 4, 3) AS e3,
+       topnbench_work_cost_1(a_random, 4, 4) AS e4
+FROM topnbench_data
+ORDER BY a_random
+LIMIT 900000;
+
+-- case: scope/subquery
+-- check: unchanged
+SET debug_projection_placement = auto;
+SET work_mem = '64MB';
+
+-- variant: total-off
+-- sample: plan
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('scope/subquery', 'total-off', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT * FROM (SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128 ORDER BY sort_key LIMIT 25000) s;
+
+-- variant: total-on
+-- sample: plan
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('scope/subquery', 'total-on', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT * FROM (SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128 ORDER BY sort_key LIMIT 25000) s;
+
+-- case: scope/with-ties
+-- check: unchanged
+
+-- variant: total-off
+-- sample: plan
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('scope/with-ties', 'total-off', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128 ORDER BY sort_key FETCH FIRST 25000 ROWS WITH TIES;
+
+-- variant: total-on
+-- sample: plan
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('scope/with-ties', 'total-on', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128 ORDER BY sort_key FETCH FIRST 25000 ROWS WITH TIES;
+
+-- case: scope/limit-zero
+-- check: unchanged
+
+-- variant: total-off
+-- sample: plan
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('scope/limit-zero', 'total-off', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128 ORDER BY sort_key LIMIT 0;
+
+-- variant: total-on
+-- sample: plan
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('scope/limit-zero', 'total-on', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128 ORDER BY sort_key LIMIT 0;
+
+-- case: scope/limit-all
+-- check: unchanged
+
+-- variant: total-off
+-- sample: plan
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('scope/limit-all', 'total-off', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128 ORDER BY sort_key LIMIT ALL;
+
+-- variant: total-on
+-- sample: plan
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('scope/limit-all', 'total-on', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key AS k, topnbench_work_cost_1(octet_length(payload), 0, 0) AS e1
+FROM topnbench_copy_width_128 ORDER BY sort_key LIMIT ALL;
+
+-- case: scope/volatile
+-- check: unchanged
+
+-- variant: total-off
+-- sample: plan
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('scope/volatile', 'total-off', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key, random() FROM topnbench_copy_width_128 ORDER BY sort_key LIMIT 25000;
+
+-- variant: total-on
+-- sample: plan
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('scope/volatile', 'total-on', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key, random() FROM topnbench_copy_width_128 ORDER BY sort_key LIMIT 25000;
+
+-- case: scope/srf
+-- check: unchanged
+
+-- variant: total-off
+-- sample: plan
+SET enable_projection_total_cost = off;
+SELECT topnbench_capture('scope/srf', 'total-off', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key, generate_series(1,2) FROM topnbench_copy_width_128 ORDER BY sort_key LIMIT 25000;
+
+-- variant: total-on
+-- sample: plan
+SET enable_projection_total_cost = on;
+SELECT topnbench_capture('scope/srf', 'total-on', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT sort_key, generate_series(1,2) FROM topnbench_copy_width_128 ORDER BY sort_key LIMIT 25000;
+
+-- case: datum-guard/int4
+-- check: datum-cheaper
+SET work_mem = '4MB';
+
+-- variant: datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard/int4', 'datum-off', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- variant: datum-on
+-- sample: plan
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-guard/int4', 'datum-on', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- variant: width-off-datum-on
+-- sample: plan
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('datum-guard/int4', 'width-off-datum-on', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- variant: width-off-datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard/int4', 'width-off-datum-off', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- case: datum-guard/int8
+-- check: datum-cheaper
+SET enable_sort_tuple_width_cost = on;
+SET enable_sort_datum_cost = on;
+
+-- variant: datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard/int8', 'datum-off', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random::bigint FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- variant: datum-on
+-- sample: plan
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-guard/int8', 'datum-on', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random::bigint FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- variant: width-off-datum-on
+-- sample: plan
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('datum-guard/int8', 'width-off-datum-on', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random::bigint FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- variant: width-off-datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard/int8', 'width-off-datum-off', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random::bigint FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- case: datum-guard/float8
+-- check: datum-cheaper
+SET enable_sort_tuple_width_cost = on;
+SET enable_sort_datum_cost = on;
+
+-- variant: datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard/float8', 'datum-off', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random::float8 FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- variant: datum-on
+-- sample: plan
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-guard/float8', 'datum-on', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random::float8 FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- variant: width-off-datum-on
+-- sample: plan
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('datum-guard/float8', 'width-off-datum-on', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random::float8 FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- variant: width-off-datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard/float8', 'width-off-datum-off', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random::float8 FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- case: datum-guard/nullable-int4
+-- check: datum-cheaper
+SET enable_sort_tuple_width_cost = on;
+SET enable_sort_datum_cost = on;
+
+-- variant: datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard/nullable-int4', 'datum-off', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT nullif(a_random % 10, 0) FROM topnbench_data ORDER BY 1 NULLS FIRST LIMIT 250000;
+
+-- variant: datum-on
+-- sample: plan
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-guard/nullable-int4', 'datum-on', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT nullif(a_random % 10, 0) FROM topnbench_data ORDER BY 1 NULLS FIRST LIMIT 250000;
+
+-- variant: width-off-datum-on
+-- sample: plan
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('datum-guard/nullable-int4', 'width-off-datum-on', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT nullif(a_random % 10, 0) FROM topnbench_data ORDER BY 1 NULLS FIRST LIMIT 250000;
+
+-- variant: width-off-datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard/nullable-int4', 'width-off-datum-off', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT nullif(a_random % 10, 0) FROM topnbench_data ORDER BY 1 NULLS FIRST LIMIT 250000;
+
+-- case: datum-guard/offset-int4
+-- check: datum-cheaper
+SET enable_sort_tuple_width_cost = on;
+SET enable_sort_datum_cost = on;
+
+-- variant: datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard/offset-int4', 'datum-off', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random FROM topnbench_data ORDER BY 1 LIMIT 1000 OFFSET 249000;
+
+-- variant: datum-on
+-- sample: plan
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-guard/offset-int4', 'datum-on', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random FROM topnbench_data ORDER BY 1 LIMIT 1000 OFFSET 249000;
+
+-- variant: width-off-datum-on
+-- sample: plan
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('datum-guard/offset-int4', 'width-off-datum-on', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random FROM topnbench_data ORDER BY 1 LIMIT 1000 OFFSET 249000;
+
+-- variant: width-off-datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard/offset-int4', 'width-off-datum-off', 'datum-cheaper', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random FROM topnbench_data ORDER BY 1 LIMIT 1000 OFFSET 249000;
+
+-- case: datum-guard/tuple-two-columns
+-- check: unchanged
+SET enable_sort_tuple_width_cost = on;
+SET enable_sort_datum_cost = on;
+
+-- variant: datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard/tuple-two-columns', 'datum-off', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random, same1 FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- variant: datum-on
+-- sample: plan
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-guard/tuple-two-columns', 'datum-on', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random, same1 FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- case: datum-guard-width-off/tuple-two-columns
+-- check: unchanged
+
+-- variant: width-off-datum-on
+-- sample: plan
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('datum-guard-width-off/tuple-two-columns', 'width-off-datum-on', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random, same1 FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- variant: width-off-datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard-width-off/tuple-two-columns', 'width-off-datum-off', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random, same1 FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- case: datum-guard/extra-sort-expression
+-- check: unchanged
+SET enable_sort_tuple_width_cost = on;
+SET enable_sort_datum_cost = on;
+
+-- variant: datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard/extra-sort-expression', 'datum-off', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random FROM topnbench_data ORDER BY same1 LIMIT 250000;
+
+-- variant: datum-on
+-- sample: plan
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-guard/extra-sort-expression', 'datum-on', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random FROM topnbench_data ORDER BY same1 LIMIT 250000;
+
+-- case: datum-guard-width-off/extra-sort-expression
+-- check: unchanged
+
+-- variant: width-off-datum-on
+-- sample: plan
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('datum-guard-width-off/extra-sort-expression', 'width-off-datum-on', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random FROM topnbench_data ORDER BY same1 LIMIT 250000;
+
+-- variant: width-off-datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard-width-off/extra-sort-expression', 'width-off-datum-off', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random FROM topnbench_data ORDER BY same1 LIMIT 250000;
+
+-- case: datum-guard/text-by-reference
+-- check: unchanged
+SET enable_sort_tuple_width_cost = on;
+SET enable_sort_datum_cost = on;
+
+-- variant: datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard/text-by-reference', 'datum-off', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random::text FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- variant: datum-on
+-- sample: plan
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-guard/text-by-reference', 'datum-on', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random::text FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- case: datum-guard-width-off/text-by-reference
+-- check: unchanged
+
+-- variant: width-off-datum-on
+-- sample: plan
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('datum-guard-width-off/text-by-reference', 'width-off-datum-on', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random::text FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- variant: width-off-datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard-width-off/text-by-reference', 'width-off-datum-off', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random::text FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- case: datum-guard/numeric-by-reference
+-- check: unchanged
+SET enable_sort_tuple_width_cost = on;
+SET enable_sort_datum_cost = on;
+
+-- variant: datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard/numeric-by-reference', 'datum-off', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random::numeric FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- variant: datum-on
+-- sample: plan
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-guard/numeric-by-reference', 'datum-on', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random::numeric FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- case: datum-guard-width-off/numeric-by-reference
+-- check: unchanged
+
+-- variant: width-off-datum-on
+-- sample: plan
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('datum-guard-width-off/numeric-by-reference', 'width-off-datum-on', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random::numeric FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- variant: width-off-datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard-width-off/numeric-by-reference', 'width-off-datum-off', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random::numeric FROM topnbench_data ORDER BY 1 LIMIT 250000;
+
+-- case: datum-guard/unbounded-sort
+-- check: unchanged
+SET enable_sort_tuple_width_cost = on;
+SET enable_sort_datum_cost = on;
+
+-- variant: datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard/unbounded-sort', 'datum-off', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random FROM topnbench_data ORDER BY 1;
+
+-- variant: datum-on
+-- sample: plan
+SET enable_sort_datum_cost = on;
+SELECT topnbench_capture('datum-guard/unbounded-sort', 'datum-on', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random FROM topnbench_data ORDER BY 1;
+
+-- case: datum-guard-width-off/unbounded-sort
+-- check: unchanged
+
+-- variant: width-off-datum-on
+-- sample: plan
+SET enable_sort_tuple_width_cost = off;
+SELECT topnbench_capture('datum-guard-width-off/unbounded-sort', 'width-off-datum-on', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random FROM topnbench_data ORDER BY 1;
+
+-- variant: width-off-datum-off
+-- sample: plan
+SET enable_sort_datum_cost = off;
+SELECT topnbench_capture('datum-guard-width-off/unbounded-sort', 'width-off-datum-off', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random FROM topnbench_data ORDER BY 1;
+
+-- case: placement-guard/no-limit
+-- check: unchanged
+SET enable_sort_tuple_width_cost = on;
+SET enable_sort_datum_cost = on;
+
+-- variant: auto
+-- sample: plan
+SELECT topnbench_capture('placement-guard/no-limit', 'auto', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random, a_random+1 FROM topnbench_data ORDER BY a_random;
+
+-- variant: early
+-- sample: plan
+SET debug_projection_placement = early;
+SELECT topnbench_capture('placement-guard/no-limit', 'early', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random, a_random+1 FROM topnbench_data ORDER BY a_random;
+
+-- variant: late
+-- sample: plan
+SET debug_projection_placement = late;
+SELECT topnbench_capture('placement-guard/no-limit', 'late', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random, a_random+1 FROM topnbench_data ORDER BY a_random;
+
+-- case: placement-guard/volatile
+-- check: unchanged
+SET debug_projection_placement = auto;
+
+-- variant: auto
+-- sample: plan
+SELECT topnbench_capture('placement-guard/volatile', 'auto', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random, random() FROM topnbench_data ORDER BY a_random LIMIT 10;
+
+-- variant: early
+-- sample: plan
+SET debug_projection_placement = early;
+SELECT topnbench_capture('placement-guard/volatile', 'early', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random, random() FROM topnbench_data ORDER BY a_random LIMIT 10;
+
+-- variant: late
+-- sample: plan
+SET debug_projection_placement = late;
+SELECT topnbench_capture('placement-guard/volatile', 'late', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random, random() FROM topnbench_data ORDER BY a_random LIMIT 10;
+
+-- case: placement-guard/srf
+-- check: unchanged
+SET debug_projection_placement = auto;
+
+-- variant: auto
+-- sample: plan
+SELECT topnbench_capture('placement-guard/srf', 'auto', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random, generate_series(1,2) FROM topnbench_data ORDER BY a_random LIMIT 10;
+
+-- variant: early
+-- sample: plan
+SET debug_projection_placement = early;
+SELECT topnbench_capture('placement-guard/srf', 'early', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random, generate_series(1,2) FROM topnbench_data ORDER BY a_random LIMIT 10;
+
+-- variant: late
+-- sample: plan
+SET debug_projection_placement = late;
+SELECT topnbench_capture('placement-guard/srf', 'late', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT a_random, generate_series(1,2) FROM topnbench_data ORDER BY a_random LIMIT 10;
+
+-- case: placement-guard/subquery
+-- check: unchanged
+SET debug_projection_placement = auto;
+
+-- variant: auto
+-- sample: plan
+SELECT topnbench_capture('placement-guard/subquery', 'auto', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT * FROM (SELECT a_random, topnbench_work_cost_1(a_random,16,1) AS e1 FROM topnbench_data ORDER BY a_random LIMIT 10) s;
+
+-- variant: early
+-- sample: plan
+SET debug_projection_placement = early;
+SELECT topnbench_capture('placement-guard/subquery', 'early', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT * FROM (SELECT a_random, topnbench_work_cost_1(a_random,16,1) AS e1 FROM topnbench_data ORDER BY a_random LIMIT 10) s;
+
+-- variant: late
+-- sample: plan
+SET debug_projection_placement = late;
+SELECT topnbench_capture('placement-guard/subquery', 'late', 'unchanged', 'plan');
+EXPLAIN (VERBOSE, FORMAT JSON)
+SELECT * FROM (SELECT a_random, topnbench_work_cost_1(a_random,16,1) AS e1 FROM topnbench_data ORDER BY a_random LIMIT 10) s;
+
+-- case: heap-release/ascending
+-- check: heap
+SET debug_projection_placement = auto;
+SET work_mem = '64MB';
+
+-- variant: datum
+-- sample: diagnostic
+SELECT topnbench_capture('heap-release/ascending', 'datum', 'heap', 'diagnostic');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT k FROM topnbench_heap_ascending
+ORDER BY k LIMIT 4096;
+
+-- variant: tuple
+-- sample: diagnostic
+SELECT topnbench_capture('heap-release/ascending', 'tuple', 'heap', 'diagnostic');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT k, payload FROM topnbench_heap_ascending
+ORDER BY k, payload LIMIT 4096;
+
+-- case: heap-release/descending
+-- check: heap
+
+-- variant: datum
+-- sample: diagnostic
+SELECT topnbench_capture('heap-release/descending', 'datum', 'heap', 'diagnostic');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT k FROM topnbench_heap_descending
+ORDER BY k LIMIT 4096;
+
+-- variant: tuple
+-- sample: diagnostic
+SELECT topnbench_capture('heap-release/descending', 'tuple', 'heap', 'diagnostic');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT k, payload FROM topnbench_heap_descending
+ORDER BY k, payload LIMIT 4096;
+
+-- case: heap-release/random
+-- check: heap
+
+-- variant: datum
+-- sample: diagnostic
+SELECT topnbench_capture('heap-release/random', 'datum', 'heap', 'diagnostic');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT k FROM topnbench_heap_random
+ORDER BY k LIMIT 4096;
+
+-- variant: tuple
+-- sample: diagnostic
+SELECT topnbench_capture('heap-release/random', 'tuple', 'heap', 'diagnostic');
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON)
+SELECT k, payload FROM topnbench_heap_random
+ORDER BY k, payload LIMIT 4096;
+
+-- Close/flush the client file BEFORE importing it.
+SELECT topnbench_capture_end();
+\o
+SELECT topnbench_file_reset();
+-- One physical line per row; JSON backslashes and quotes remain unchanged.
+\copy topnbench_file_lines(line) FROM 'topnbench-plans.log' WITH (FORMAT csv, DELIMITER E'\x01', QUOTE E'\x02')
+SELECT topnbench_file_load();
+\pset tuples_only off
+\pset format aligned
+SELECT * FROM topnbench_file_report();
+SELECT * FROM topnbench_file_ratios();
+SELECT * FROM topnbench_file_checks();

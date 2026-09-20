@@ -35,6 +35,7 @@ PG_FUNCTION_INFO_V1(topnbench_work);
 PG_FUNCTION_INFO_V1(topnbench_run);
 PG_FUNCTION_INFO_V1(topnbench_compare);
 PG_FUNCTION_INFO_V1(topnbench_measure);
+PG_FUNCTION_INFO_V1(topnbench_explain);
 
 #define DECISION_NOISE_FRACTION 0.03
 
@@ -433,6 +434,42 @@ validate_select(const char *sql)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("SELECT INTO and row locking are not supported")));
+}
+
+/* Return the complete plan; SQL helpers own storage and statistical analysis. */
+Datum
+topnbench_explain(PG_FUNCTION_ARGS)
+{
+	char	   *query = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	bool		analyze = PG_GETARG_BOOL(1);
+	StringInfoData sql;
+	char	   *json;
+	char	   *saved;
+	Datum		result;
+	int			rc;
+
+	/* Reject extra statements and non-SELECT input before executing anything. */
+	validate_select(query);
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "EXPLAIN (%sVERBOSE, COSTS ON, FORMAT JSON) %s",
+					 analyze ? "ANALYZE, TIMING OFF, SUMMARY ON, " : "",
+					 query);
+	rc = SPI_execute(sql.data, false, 0);
+	if (rc != SPI_OK_UTILITY || SPI_processed != 1 || SPI_tuptable == NULL)
+		elog(ERROR, "topnbench EXPLAIN did not return one plan");
+	json = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+	if (json == NULL)
+		elog(ERROR, "topnbench EXPLAIN returned NULL");
+	/* Copy into the caller's context before SPI_finish releases SPI memory. */
+	saved = SPI_palloc(strlen(json) + 1);
+	strcpy(saved, json);
+	SPI_finish();
+	result = DirectFunctionCall1(jsonb_in, CStringGetDatum(saved));
+	pfree(saved);
+	PG_RETURN_DATUM(result);
 }
 
 static double
