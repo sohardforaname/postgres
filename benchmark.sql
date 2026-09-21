@@ -82,6 +82,7 @@ ORDER BY name;
 
 \if :setup
 \echo '=== Setup (excluded from timings) ==='
+DROP SCHEMA IF EXISTS sg_review CASCADE;
 CREATE SCHEMA sg_review;
 
 CREATE TABLE wide_heap (
@@ -417,4 +418,4 @@ SELECT count(*) = 1 AS inheritance_ok FROM
 
 \echo '=== End:' :label '==='
 -- Objects remain for repeat runs. Cleanup only when finished, in this test DB:
-DROP SCHEMA sg_review CASCADE;
+-- DROP SCHEMA sg_review CASCADE;
