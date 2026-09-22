@@ -17,6 +17,7 @@
 #include "postgres.h"
 
 #include "catalog/pg_class.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -45,6 +46,7 @@ typedef struct FullJoinRewriteContext
 
 static Node *rewrite_full_join_queries(Node *node, int *remaining);
 static Query *rewrite_full_join_query(Query *query, int *remaining);
+static bool full_join_input_has_foreign_table(RangeTblEntry *rte);
 static bool unsafe_full_join_input(Node *node, void *context);
 static bool has_record_wholerow(Node *node, void *context);
 static bool full_join_has_volatile(Node *node, void *context);
@@ -74,6 +76,41 @@ rewrite_full_join_queries(Node *node, int *remaining)
 	if (IsA(node, Query))
 		return (Node *) rewrite_full_join_query((Query *) node, remaining);
 	return expression_tree_mutator(node, rewrite_full_join_queries, remaining);
+}
+
+/* Inheritance expansion has not yet exposed foreign descendants as RTEs. */
+static bool
+full_join_input_has_foreign_table(RangeTblEntry *rte)
+{
+	List	   *relids;
+	ListCell   *lc;
+	bool		found = false;
+
+	if (rte->rtekind != RTE_RELATION)
+		return false;
+	if (rte->relkind == RELKIND_FOREIGN_TABLE)
+		return true;
+	/* ONLY does not scan descendants, even if the table has foreign children. */
+	if (!rte->inh || !has_subclass(rte->relid))
+		return false;
+
+	/*
+	 * Include indirect descendants and use the locks that ordinary inheritance
+	 * expansion would acquire.  Retain them so a child cannot disappear while
+	 * its relkind is inspected.  Conservatively check all descendants, even
+	 * partitions that subsequent planning might prune.
+	 */
+	relids = find_all_inheritors(rte->relid, rte->rellockmode, NULL);
+	foreach(lc, relids)
+	{
+		if (get_rel_relkind(lfirst_oid(lc)) == RELKIND_FOREIGN_TABLE)
+		{
+			found = true;
+			break;
+		}
+	}
+	list_free(relids);
+	return found;
 }
 
 /*
@@ -117,8 +154,7 @@ unsafe_full_join_input(Node *node, void *context)
 			rte->securityQuals || rte->rtekind == RTE_CTE ||
 			rte->rtekind == RTE_FUNCTION || rte->rtekind == RTE_TABLEFUNC ||
 			rte->rtekind == RTE_NAMEDTUPLESTORE ||
-			(rte->rtekind == RTE_RELATION &&
-			 rte->relkind == RELKIND_FOREIGN_TABLE))
+			full_join_input_has_foreign_table(rte))
 			return true;
 		return false;			/* range_table_entry_walker visits contents */
 	}

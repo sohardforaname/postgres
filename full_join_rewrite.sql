@@ -1,14 +1,9 @@
 -- FULL JOIN rewrite tests.
--- Run: psql -X -f benchmark.sql > benchmark.out 2>&1
+-- Run: psql -X -f full_join_rewrite.sql > full_join_rewrite.out 2>&1
 -- Every pass value must be 1; marked EXPECTED ERROR cases are intentional.
--- Add -v fj_test_file_fdw=1 to enable optional file_fdw tests.
 \set ON_ERROR_STOP on
 \pset pager off
 \timing on
-\if :{?fj_test_file_fdw}
-\else
-\set fj_test_file_fdw false
-\endif
 \set fj_rls_ran false
 \set fj_fdw_ran false
 BEGIN;
@@ -3871,10 +3866,8 @@ SET LOCAL ROLE :"fj_original_role";
 \endif
 \endif
 
--- Optional FDW cases. This is a local deterministic foreign scan, not a
--- postgres_fdw loopback connection that needs authentication or committed data.
--- The program merely prints five fixed CSV rows, including duplicates/NULLs.
-\if :fj_test_file_fdw
+-- FDW tests run automatically when superuser and file_fdw are available.
+-- Server-side printf supplies five fixed CSV rows, including duplicates/NULLs.
 SELECT rolsuper AND EXISTS (SELECT 1 FROM pg_available_extensions
                            WHERE name='file_fdw') AS can_file_fdw
 FROM pg_roles WHERE rolname=current_user
@@ -3992,11 +3985,471 @@ SELECT 'G05 foreign input/on' AS guard_case,
        1 / ((:'fj_guard_sqlstate' = '0A000')::int) AS pass;
 RELEASE SAVEPOINT fj_expected_error;
 
+-- Foreign descendants are not yet separate RTEs when the rewrite runs.
+CREATE TABLE fdw_inh_parent(id int,k int);
+INSERT INTO fdw_inh_parent VALUES (10,1),(11,NULL);
+CREATE FOREIGN TABLE fdw_inh_child () INHERITS (fdw_inh_parent)
+ SERVER fj_rewrite_file_server
+ OPTIONS (program 'printf ''1,1\n2,1\n3,\n4,4\n4,4\n''', format 'csv');
+
+CREATE TABLE fdw_part_parent(id int,k int) PARTITION BY RANGE(id);
+CREATE FOREIGN TABLE fdw_part_child PARTITION OF fdw_part_parent
+ FOR VALUES FROM (0) TO (10)
+ SERVER fj_rewrite_file_server
+ OPTIONS (program 'printf ''1,1\n2,1\n3,\n4,4\n4,4\n''', format 'csv');
+CREATE TABLE fdw_part_local PARTITION OF fdw_part_parent
+ FOR VALUES FROM (10) TO (20);
+INSERT INTO fdw_part_local VALUES (12,1),(13,NULL);
+
+CREATE TABLE fdw_multi_parent(id int,k int) PARTITION BY RANGE(id);
+CREATE TABLE fdw_multi_middle PARTITION OF fdw_multi_parent
+ FOR VALUES FROM (0) TO (10) PARTITION BY RANGE(id);
+CREATE FOREIGN TABLE fdw_multi_leaf PARTITION OF fdw_multi_middle
+ FOR VALUES FROM (0) TO (5)
+ SERVER fj_rewrite_file_server
+ OPTIONS (program 'printf ''1,1\n2,1\n3,\n4,4\n4,4\n''', format 'csv');
+CREATE TABLE fdw_multi_local PARTITION OF fdw_multi_middle
+ FOR VALUES FROM (5) TO (10);
+INSERT INTO fdw_multi_local VALUES (6,1),(7,NULL);
+
+CREATE TABLE fdw_deep_parent(id int,k int);
+CREATE TABLE fdw_deep_middle () INHERITS (fdw_deep_parent);
+CREATE FOREIGN TABLE fdw_deep_leaf () INHERITS (fdw_deep_middle)
+ SERVER fj_rewrite_file_server
+ OPTIONS (program 'printf ''1,1\n2,1\n3,\n4,4\n4,4\n''', format 'csv');
+INSERT INTO fdw_deep_parent VALUES (20,2);
+INSERT INTO fdw_deep_middle VALUES (21,NULL);
+
+CREATE TABLE fdw_diamond_parent(id int,k int);
+CREATE TABLE fdw_diamond_left () INHERITS (fdw_diamond_parent);
+CREATE TABLE fdw_diamond_right () INHERITS (fdw_diamond_parent);
+CREATE FOREIGN TABLE fdw_diamond_leaf ()
+ INHERITS (fdw_diamond_left,fdw_diamond_right)
+ SERVER fj_rewrite_file_server
+ OPTIONS (program 'printf ''1,1\n2,1\n3,\n4,4\n4,4\n''', format 'csv');
+
+SELECT 1 / ((count(*)=7)::int) AS pass FROM fdw_inh_parent;
+SELECT 1 / ((count(*)=2)::int) AS pass FROM ONLY fdw_inh_parent;
+SELECT 1 / ((count(*)=7)::int) AS pass FROM fdw_part_parent;
+SELECT 1 / ((count(*)=0)::int) AS pass FROM ONLY fdw_part_parent;
+SELECT 1 / ((count(*)=7)::int) AS pass FROM fdw_multi_parent;
+SELECT 1 / ((count(*)=7)::int) AS pass FROM fdw_deep_parent;
+SELECT 1 / ((count(*)=5)::int) AS pass FROM fdw_diamond_parent;
+
+-- 188. FDW GUARD: inheritance parent on the left
+\echo 'CASE 188: FDW GUARD: inheritance parent on the left'
+\echo 'PLAN: retain Full Join with inherited Foreign Scan.'
+SET LOCAL enable_full_join_rewrite = off;
+CREATE TEMP TABLE expected AS
+SELECT f.id AS fid,b.id AS bid,f.k AS fk,b.k AS bk FROM fdw_inh_parent f FULL JOIN b ON f.k=b.k;
+SET LOCAL enable_full_join_rewrite = on;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id AS fid,b.id AS bid,f.k AS fk,b.k AS bk FROM fdw_inh_parent f FULL JOIN b ON f.k=b.k;
+CREATE TEMP TABLE actual AS
+SELECT f.id AS fid,b.id AS bid,f.k AS fk,b.k AS bk FROM fdw_inh_parent f FULL JOIN b ON f.k=b.k;
+SELECT '188' AS case_id, 1 / ((count(*) = 0)::int) AS pass
+FROM (
+  (SELECT * FROM expected EXCEPT ALL SELECT * FROM actual)
+  UNION ALL
+  (SELECT * FROM actual EXCEPT ALL SELECT * FROM expected)
+) AS difference;
+DROP TABLE expected, actual;
+
+-- 189. FDW GUARD: inheritance parent on the right and nullable WHERE
+\echo 'CASE 189: FDW GUARD: inheritance parent on the right and nullable WHERE'
+\echo 'PLAN: retain Full Join and NULL-preserving filter.'
+SET LOCAL enable_full_join_rewrite = off;
+CREATE TEMP TABLE expected AS
+SELECT a.id AS aid,f.id AS fid FROM a FULL JOIN fdw_inh_parent f ON a.k=f.k WHERE a.k IS NULL OR f.k IS NULL;
+SET LOCAL enable_full_join_rewrite = on;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT a.id AS aid,f.id AS fid FROM a FULL JOIN fdw_inh_parent f ON a.k=f.k WHERE a.k IS NULL OR f.k IS NULL;
+CREATE TEMP TABLE actual AS
+SELECT a.id AS aid,f.id AS fid FROM a FULL JOIN fdw_inh_parent f ON a.k=f.k WHERE a.k IS NULL OR f.k IS NULL;
+SELECT '189' AS case_id, 1 / ((count(*) = 0)::int) AS pass
+FROM (
+  (SELECT * FROM expected EXCEPT ALL SELECT * FROM actual)
+  UNION ALL
+  (SELECT * FROM actual EXCEPT ALL SELECT * FROM expected)
+) AS difference;
+DROP TABLE expected, actual;
+
+-- 190. FDW GUARD: foreign partition
+\echo 'CASE 190: FDW GUARD: foreign partition'
+\echo 'PLAN: retain Full Join with local and foreign partitions.'
+SET LOCAL enable_full_join_rewrite = off;
+CREATE TEMP TABLE expected AS
+SELECT f.id AS fid,b.id AS bid FROM fdw_part_parent f FULL JOIN b ON f.k=b.k;
+SET LOCAL enable_full_join_rewrite = on;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id AS fid,b.id AS bid FROM fdw_part_parent f FULL JOIN b ON f.k=b.k;
+CREATE TEMP TABLE actual AS
+SELECT f.id AS fid,b.id AS bid FROM fdw_part_parent f FULL JOIN b ON f.k=b.k;
+SELECT '190' AS case_id, 1 / ((count(*) = 0)::int) AS pass
+FROM (
+  (SELECT * FROM expected EXCEPT ALL SELECT * FROM actual)
+  UNION ALL
+  (SELECT * FROM actual EXCEPT ALL SELECT * FROM expected)
+) AS difference;
+DROP TABLE expected, actual;
+
+-- 191. FDW GUARD: foreign leaf below two partition levels
+\echo 'CASE 191: FDW GUARD: foreign leaf below two partition levels'
+\echo 'PLAN: retain Full Join with indirect Foreign Scan.'
+SET LOCAL enable_full_join_rewrite = off;
+CREATE TEMP TABLE expected AS
+SELECT f.id AS fid,b.id AS bid FROM fdw_multi_parent f FULL JOIN b ON f.k=b.k;
+SET LOCAL enable_full_join_rewrite = on;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id AS fid,b.id AS bid FROM fdw_multi_parent f FULL JOIN b ON f.k=b.k;
+CREATE TEMP TABLE actual AS
+SELECT f.id AS fid,b.id AS bid FROM fdw_multi_parent f FULL JOIN b ON f.k=b.k;
+SELECT '191' AS case_id, 1 / ((count(*) = 0)::int) AS pass
+FROM (
+  (SELECT * FROM expected EXCEPT ALL SELECT * FROM actual)
+  UNION ALL
+  (SELECT * FROM actual EXCEPT ALL SELECT * FROM expected)
+) AS difference;
+DROP TABLE expected, actual;
+
+-- 192. FDW GUARD: parent hidden inside a subquery input
+\echo 'CASE 192: FDW GUARD: parent hidden inside a subquery input'
+\echo 'PLAN: retain Full Join even before subquery pull-up.'
+SET LOCAL enable_full_join_rewrite = off;
+CREATE TEMP TABLE expected AS
+SELECT f.id AS fid,b.id AS bid FROM (SELECT id,k FROM fdw_inh_parent WHERE id<>10) f FULL JOIN b ON f.k=b.k;
+SET LOCAL enable_full_join_rewrite = on;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id AS fid,b.id AS bid FROM (SELECT id,k FROM fdw_inh_parent WHERE id<>10) f FULL JOIN b ON f.k=b.k;
+CREATE TEMP TABLE actual AS
+SELECT f.id AS fid,b.id AS bid FROM (SELECT id,k FROM fdw_inh_parent WHERE id<>10) f FULL JOIN b ON f.k=b.k;
+SELECT '192' AS case_id, 1 / ((count(*) = 0)::int) AS pass
+FROM (
+  (SELECT * FROM expected EXCEPT ALL SELECT * FROM actual)
+  UNION ALL
+  (SELECT * FROM actual EXCEPT ALL SELECT * FROM expected)
+) AS difference;
+DROP TABLE expected, actual;
+
+-- 193. MIXED FDW: inherited foreign input and local sibling
+\echo 'CASE 193: MIXED FDW: inherited foreign input and local sibling'
+\echo 'PLAN: f/b stays Full; local x/y should use Append.'
+SET LOCAL enable_full_join_rewrite = off;
+CREATE TEMP TABLE expected AS
+SELECT f.id AS fid,b.id AS bid,x.id AS xid,y.id AS yid FROM (fdw_inh_parent f FULL JOIN b ON f.k=b.k) CROSS JOIN (c x FULL JOIN c y ON x.k=y.k);
+SET LOCAL enable_full_join_rewrite = on;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id AS fid,b.id AS bid,x.id AS xid,y.id AS yid FROM (fdw_inh_parent f FULL JOIN b ON f.k=b.k) CROSS JOIN (c x FULL JOIN c y ON x.k=y.k);
+CREATE TEMP TABLE actual AS
+SELECT f.id AS fid,b.id AS bid,x.id AS xid,y.id AS yid FROM (fdw_inh_parent f FULL JOIN b ON f.k=b.k) CROSS JOIN (c x FULL JOIN c y ON x.k=y.k);
+SELECT '193' AS case_id, 1 / ((count(*) = 0)::int) AS pass
+FROM (
+  (SELECT * FROM expected EXCEPT ALL SELECT * FROM actual)
+  UNION ALL
+  (SELECT * FROM actual EXCEPT ALL SELECT * FROM expected)
+) AS difference;
+DROP TABLE expected, actual;
+
+-- 194. ONLY inheritance parent: non-equality join may rewrite
+\echo 'CASE 194: ONLY inheritance parent: non-equality join may rewrite'
+\echo 'PLAN: Append with left/anti joins; no Foreign Scan.'
+SET LOCAL enable_full_join_rewrite = off;
+CREATE TEMP TABLE expected AS
+SELECT f.id AS fid,b.id AS bid FROM ONLY fdw_inh_parent f INNER JOIN b ON f.k<b.k
+UNION ALL SELECT f.id,NULL::int FROM ONLY fdw_inh_parent f WHERE NOT EXISTS (SELECT 1 FROM b WHERE f.k<b.k)
+UNION ALL SELECT NULL::int,b.id FROM b WHERE NOT EXISTS (SELECT 1 FROM ONLY fdw_inh_parent f WHERE f.k<b.k);
+SET LOCAL enable_full_join_rewrite = on;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id AS fid,b.id AS bid FROM ONLY fdw_inh_parent f FULL JOIN b ON f.k<b.k;
+CREATE TEMP TABLE actual AS
+SELECT f.id AS fid,b.id AS bid FROM ONLY fdw_inh_parent f FULL JOIN b ON f.k<b.k;
+SELECT '194' AS case_id, 1 / ((count(*) = 0)::int) AS pass
+FROM (
+  (SELECT * FROM expected EXCEPT ALL SELECT * FROM actual)
+  UNION ALL
+  (SELECT * FROM actual EXCEPT ALL SELECT * FROM expected)
+) AS difference;
+DROP TABLE expected, actual;
+
+-- 195. ONLY partitioned parent: empty input may rewrite
+\echo 'CASE 195: ONLY partitioned parent: empty input may rewrite'
+\echo 'PLAN: no Foreign Scan; result contains every b row.'
+SET LOCAL enable_full_join_rewrite = off;
+CREATE TEMP TABLE expected AS
+SELECT NULL::int AS fid,b.id AS bid FROM b;
+SET LOCAL enable_full_join_rewrite = on;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id AS fid,b.id AS bid FROM ONLY fdw_part_parent f FULL JOIN b ON f.k<b.k;
+CREATE TEMP TABLE actual AS
+SELECT f.id AS fid,b.id AS bid FROM ONLY fdw_part_parent f FULL JOIN b ON f.k<b.k;
+SELECT '195' AS case_id, 1 / ((count(*) = 0)::int) AS pass
+FROM (
+  (SELECT * FROM expected EXCEPT ALL SELECT * FROM actual)
+  UNION ALL
+  (SELECT * FROM actual EXCEPT ALL SELECT * FROM expected)
+) AS difference;
+DROP TABLE expected, actual;
+
+-- 196. FDW GUARD: indirect ordinary inheritance child
+\echo 'CASE 196: FDW GUARD: indirect ordinary inheritance child'
+\echo 'PLAN: retain Full Join with indirect Foreign Scan.'
+SET LOCAL enable_full_join_rewrite = off;
+CREATE TEMP TABLE expected AS
+SELECT f.id AS fid,b.id AS bid FROM fdw_deep_parent f FULL JOIN b ON f.k=b.k;
+SET LOCAL enable_full_join_rewrite = on;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id AS fid,b.id AS bid FROM fdw_deep_parent f FULL JOIN b ON f.k=b.k;
+CREATE TEMP TABLE actual AS
+SELECT f.id AS fid,b.id AS bid FROM fdw_deep_parent f FULL JOIN b ON f.k=b.k;
+SELECT '196' AS case_id, 1 / ((count(*) = 0)::int) AS pass
+FROM (
+  (SELECT * FROM expected EXCEPT ALL SELECT * FROM actual)
+  UNION ALL
+  (SELECT * FROM actual EXCEPT ALL SELECT * FROM expected)
+) AS difference;
+DROP TABLE expected, actual;
+
+-- 197. FDW GUARD: foreign partition could later be pruned
+\echo 'CASE 197: FDW GUARD: foreign partition could later be pruned'
+\echo 'PLAN: retain Full Join; descendant check precedes pruning.'
+SET LOCAL enable_full_join_rewrite = off;
+CREATE TEMP TABLE expected AS
+SELECT f.id AS fid,b.id AS bid FROM (SELECT id,k FROM fdw_part_parent WHERE id>=10) f FULL JOIN b ON f.k=b.k;
+SET LOCAL enable_full_join_rewrite = on;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id AS fid,b.id AS bid FROM (SELECT id,k FROM fdw_part_parent WHERE id>=10) f FULL JOIN b ON f.k=b.k;
+CREATE TEMP TABLE actual AS
+SELECT f.id AS fid,b.id AS bid FROM (SELECT id,k FROM fdw_part_parent WHERE id>=10) f FULL JOIN b ON f.k=b.k;
+SELECT '197' AS case_id, 1 / ((count(*) = 0)::int) AS pass
+FROM (
+  (SELECT * FROM expected EXCEPT ALL SELECT * FROM actual)
+  UNION ALL
+  (SELECT * FROM actual EXCEPT ALL SELECT * FROM expected)
+) AS difference;
+DROP TABLE expected, actual;
+
+-- 198. FDW GUARD: ONLY directly names a foreign table
+\echo 'CASE 198: FDW GUARD: ONLY directly names a foreign table'
+\echo 'PLAN: retain Full Join; ONLY does not make a foreign table safe.'
+SET LOCAL enable_full_join_rewrite = off;
+CREATE TEMP TABLE expected AS
+SELECT f.id AS fid,b.id AS bid FROM ONLY fdw_inh_child f FULL JOIN b ON f.k=b.k;
+SET LOCAL enable_full_join_rewrite = on;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id AS fid,b.id AS bid FROM ONLY fdw_inh_child f FULL JOIN b ON f.k=b.k;
+CREATE TEMP TABLE actual AS
+SELECT f.id AS fid,b.id AS bid FROM ONLY fdw_inh_child f FULL JOIN b ON f.k=b.k;
+SELECT '198' AS case_id, 1 / ((count(*) = 0)::int) AS pass
+FROM (
+  (SELECT * FROM expected EXCEPT ALL SELECT * FROM actual)
+  UNION ALL
+  (SELECT * FROM actual EXCEPT ALL SELECT * FROM expected)
+) AS difference;
+DROP TABLE expected, actual;
+
+-- 199. FDW GUARD: diamond inheritance reaches one foreign leaf twice
+\echo 'CASE 199: FDW GUARD: diamond inheritance reaches one foreign leaf twice'
+\echo 'PLAN: retain Full Join; scan the shared foreign leaf once.'
+SET LOCAL enable_full_join_rewrite = off;
+CREATE TEMP TABLE expected AS
+SELECT f.id AS fid,b.id AS bid FROM fdw_diamond_parent f FULL JOIN b ON f.k=b.k;
+SET LOCAL enable_full_join_rewrite = on;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id AS fid,b.id AS bid FROM fdw_diamond_parent f FULL JOIN b ON f.k=b.k;
+CREATE TEMP TABLE actual AS
+SELECT f.id AS fid,b.id AS bid FROM fdw_diamond_parent f FULL JOIN b ON f.k=b.k;
+SELECT '199' AS case_id, 1 / ((count(*) = 0)::int) AS pass
+FROM (
+  (SELECT * FROM expected EXCEPT ALL SELECT * FROM actual)
+  UNION ALL
+  (SELECT * FROM actual EXCEPT ALL SELECT * FROM expected)
+) AS difference;
+DROP TABLE expected, actual;
+
+\echo 'EXPECTED ERROR: G06 foreign inheritance child, rewrite=off; SQLSTATE must be 0A000'
+SET LOCAL enable_full_join_rewrite = off;
+SAVEPOINT fj_expected_error;
+\set ON_ERROR_STOP off
+SELECT count(*) FROM fdw_inh_parent f FULL JOIN b ON f.k<b.k;
+\set fj_guard_sqlstate :SQLSTATE
+\set ON_ERROR_STOP on
+ROLLBACK TO SAVEPOINT fj_expected_error;
+SELECT 'G06 foreign inheritance child/off' AS guard_case,
+       :'fj_guard_sqlstate' AS observed_sqlstate,
+       1 / ((:'fj_guard_sqlstate' = '0A000')::int) AS pass;
+RELEASE SAVEPOINT fj_expected_error;
+
+\echo 'EXPECTED ERROR: G06 foreign inheritance child, rewrite=on; SQLSTATE must be 0A000'
+SET LOCAL enable_full_join_rewrite = on;
+SAVEPOINT fj_expected_error;
+\set ON_ERROR_STOP off
+SELECT count(*) FROM fdw_inh_parent f FULL JOIN b ON f.k<b.k;
+\set fj_guard_sqlstate :SQLSTATE
+\set ON_ERROR_STOP on
+ROLLBACK TO SAVEPOINT fj_expected_error;
+SELECT 'G06 foreign inheritance child/on' AS guard_case,
+       :'fj_guard_sqlstate' AS observed_sqlstate,
+       1 / ((:'fj_guard_sqlstate' = '0A000')::int) AS pass;
+RELEASE SAVEPOINT fj_expected_error;
+
+\echo 'EXPECTED ERROR: G07 foreign partition, rewrite=off; SQLSTATE must be 0A000'
+SET LOCAL enable_full_join_rewrite = off;
+SAVEPOINT fj_expected_error;
+\set ON_ERROR_STOP off
+SELECT count(*) FROM fdw_part_parent f FULL JOIN b ON f.k<b.k;
+\set fj_guard_sqlstate :SQLSTATE
+\set ON_ERROR_STOP on
+ROLLBACK TO SAVEPOINT fj_expected_error;
+SELECT 'G07 foreign partition/off' AS guard_case,
+       :'fj_guard_sqlstate' AS observed_sqlstate,
+       1 / ((:'fj_guard_sqlstate' = '0A000')::int) AS pass;
+RELEASE SAVEPOINT fj_expected_error;
+
+\echo 'EXPECTED ERROR: G07 foreign partition, rewrite=on; SQLSTATE must be 0A000'
+SET LOCAL enable_full_join_rewrite = on;
+SAVEPOINT fj_expected_error;
+\set ON_ERROR_STOP off
+SELECT count(*) FROM fdw_part_parent f FULL JOIN b ON f.k<b.k;
+\set fj_guard_sqlstate :SQLSTATE
+\set ON_ERROR_STOP on
+ROLLBACK TO SAVEPOINT fj_expected_error;
+SELECT 'G07 foreign partition/on' AS guard_case,
+       :'fj_guard_sqlstate' AS observed_sqlstate,
+       1 / ((:'fj_guard_sqlstate' = '0A000')::int) AS pass;
+RELEASE SAVEPOINT fj_expected_error;
+
+\echo 'EXPECTED ERROR: G08 indirect foreign partition, rewrite=off; SQLSTATE must be 0A000'
+SET LOCAL enable_full_join_rewrite = off;
+SAVEPOINT fj_expected_error;
+\set ON_ERROR_STOP off
+SELECT count(*) FROM fdw_multi_parent f FULL JOIN b ON f.k<b.k;
+\set fj_guard_sqlstate :SQLSTATE
+\set ON_ERROR_STOP on
+ROLLBACK TO SAVEPOINT fj_expected_error;
+SELECT 'G08 indirect foreign partition/off' AS guard_case,
+       :'fj_guard_sqlstate' AS observed_sqlstate,
+       1 / ((:'fj_guard_sqlstate' = '0A000')::int) AS pass;
+RELEASE SAVEPOINT fj_expected_error;
+
+\echo 'EXPECTED ERROR: G08 indirect foreign partition, rewrite=on; SQLSTATE must be 0A000'
+SET LOCAL enable_full_join_rewrite = on;
+SAVEPOINT fj_expected_error;
+\set ON_ERROR_STOP off
+SELECT count(*) FROM fdw_multi_parent f FULL JOIN b ON f.k<b.k;
+\set fj_guard_sqlstate :SQLSTATE
+\set ON_ERROR_STOP on
+ROLLBACK TO SAVEPOINT fj_expected_error;
+SELECT 'G08 indirect foreign partition/on' AS guard_case,
+       :'fj_guard_sqlstate' AS observed_sqlstate,
+       1 / ((:'fj_guard_sqlstate' = '0A000')::int) AS pass;
+RELEASE SAVEPOINT fj_expected_error;
+
+\echo 'EXPECTED ERROR: G09 indirect foreign inheritance child, rewrite=off; SQLSTATE must be 0A000'
+SET LOCAL enable_full_join_rewrite = off;
+SAVEPOINT fj_expected_error;
+\set ON_ERROR_STOP off
+SELECT count(*) FROM fdw_deep_parent f FULL JOIN b ON f.k<b.k;
+\set fj_guard_sqlstate :SQLSTATE
+\set ON_ERROR_STOP on
+ROLLBACK TO SAVEPOINT fj_expected_error;
+SELECT 'G09 indirect foreign inheritance child/off' AS guard_case,
+       :'fj_guard_sqlstate' AS observed_sqlstate,
+       1 / ((:'fj_guard_sqlstate' = '0A000')::int) AS pass;
+RELEASE SAVEPOINT fj_expected_error;
+
+\echo 'EXPECTED ERROR: G09 indirect foreign inheritance child, rewrite=on; SQLSTATE must be 0A000'
+SET LOCAL enable_full_join_rewrite = on;
+SAVEPOINT fj_expected_error;
+\set ON_ERROR_STOP off
+SELECT count(*) FROM fdw_deep_parent f FULL JOIN b ON f.k<b.k;
+\set fj_guard_sqlstate :SQLSTATE
+\set ON_ERROR_STOP on
+ROLLBACK TO SAVEPOINT fj_expected_error;
+SELECT 'G09 indirect foreign inheritance child/on' AS guard_case,
+       :'fj_guard_sqlstate' AS observed_sqlstate,
+       1 / ((:'fj_guard_sqlstate' = '0A000')::int) AS pass;
+RELEASE SAVEPOINT fj_expected_error;
+
+\echo 'EXPECTED ERROR: G10 potentially pruned foreign partition, rewrite=off; SQLSTATE must be 0A000'
+SET LOCAL enable_full_join_rewrite = off;
+SAVEPOINT fj_expected_error;
+\set ON_ERROR_STOP off
+SELECT count(*) FROM (SELECT id,k FROM fdw_part_parent WHERE id>=10) f FULL JOIN b ON f.k<b.k;
+\set fj_guard_sqlstate :SQLSTATE
+\set ON_ERROR_STOP on
+ROLLBACK TO SAVEPOINT fj_expected_error;
+SELECT 'G10 potentially pruned foreign partition/off' AS guard_case,
+       :'fj_guard_sqlstate' AS observed_sqlstate,
+       1 / ((:'fj_guard_sqlstate' = '0A000')::int) AS pass;
+RELEASE SAVEPOINT fj_expected_error;
+
+\echo 'EXPECTED ERROR: G10 potentially pruned foreign partition, rewrite=on; SQLSTATE must be 0A000'
+SET LOCAL enable_full_join_rewrite = on;
+SAVEPOINT fj_expected_error;
+\set ON_ERROR_STOP off
+SELECT count(*) FROM (SELECT id,k FROM fdw_part_parent WHERE id>=10) f FULL JOIN b ON f.k<b.k;
+\set fj_guard_sqlstate :SQLSTATE
+\set ON_ERROR_STOP on
+ROLLBACK TO SAVEPOINT fj_expected_error;
+SELECT 'G10 potentially pruned foreign partition/on' AS guard_case,
+       :'fj_guard_sqlstate' AS observed_sqlstate,
+       1 / ((:'fj_guard_sqlstate' = '0A000')::int) AS pass;
+RELEASE SAVEPOINT fj_expected_error;
+
+\echo 'EXPECTED ERROR: G11 ONLY foreign table, rewrite=off; SQLSTATE must be 0A000'
+SET LOCAL enable_full_join_rewrite = off;
+SAVEPOINT fj_expected_error;
+\set ON_ERROR_STOP off
+SELECT count(*) FROM ONLY fdw_inh_child f FULL JOIN b ON f.k<b.k;
+\set fj_guard_sqlstate :SQLSTATE
+\set ON_ERROR_STOP on
+ROLLBACK TO SAVEPOINT fj_expected_error;
+SELECT 'G11 ONLY foreign table/off' AS guard_case,
+       :'fj_guard_sqlstate' AS observed_sqlstate,
+       1 / ((:'fj_guard_sqlstate' = '0A000')::int) AS pass;
+RELEASE SAVEPOINT fj_expected_error;
+
+\echo 'EXPECTED ERROR: G11 ONLY foreign table, rewrite=on; SQLSTATE must be 0A000'
+SET LOCAL enable_full_join_rewrite = on;
+SAVEPOINT fj_expected_error;
+\set ON_ERROR_STOP off
+SELECT count(*) FROM ONLY fdw_inh_child f FULL JOIN b ON f.k<b.k;
+\set fj_guard_sqlstate :SQLSTATE
+\set ON_ERROR_STOP on
+ROLLBACK TO SAVEPOINT fj_expected_error;
+SELECT 'G11 ONLY foreign table/on' AS guard_case,
+       :'fj_guard_sqlstate' AS observed_sqlstate,
+       1 / ((:'fj_guard_sqlstate' = '0A000')::int) AS pass;
+RELEASE SAVEPOINT fj_expected_error;
+
+\echo 'EXPECTED ERROR: G12 diamond foreign inheritance child, rewrite=off; SQLSTATE must be 0A000'
+SET LOCAL enable_full_join_rewrite = off;
+SAVEPOINT fj_expected_error;
+\set ON_ERROR_STOP off
+SELECT count(*) FROM fdw_diamond_parent f FULL JOIN b ON f.k<b.k;
+\set fj_guard_sqlstate :SQLSTATE
+\set ON_ERROR_STOP on
+ROLLBACK TO SAVEPOINT fj_expected_error;
+SELECT 'G12 diamond foreign inheritance child/off' AS guard_case,
+       :'fj_guard_sqlstate' AS observed_sqlstate,
+       1 / ((:'fj_guard_sqlstate' = '0A000')::int) AS pass;
+RELEASE SAVEPOINT fj_expected_error;
+
+\echo 'EXPECTED ERROR: G12 diamond foreign inheritance child, rewrite=on; SQLSTATE must be 0A000'
+SET LOCAL enable_full_join_rewrite = on;
+SAVEPOINT fj_expected_error;
+\set ON_ERROR_STOP off
+SELECT count(*) FROM fdw_diamond_parent f FULL JOIN b ON f.k<b.k;
+\set fj_guard_sqlstate :SQLSTATE
+\set ON_ERROR_STOP on
+ROLLBACK TO SAVEPOINT fj_expected_error;
+SELECT 'G12 diamond foreign inheritance child/on' AS guard_case,
+       :'fj_guard_sqlstate' AS observed_sqlstate,
+       1 / ((:'fj_guard_sqlstate' = '0A000')::int) AS pass;
+RELEASE SAVEPOINT fj_expected_error;
+
 \else
 \echo 'SKIP FDW group: requires superuser and available file_fdw extension.'
-\endif
-\else
-\echo 'SKIP FDW group: enable with psql -v fj_test_file_fdw=1 on a server with POSIX printf.'
 \endif
 
 -- Prepared parameters: inspect generic and custom plans separately.

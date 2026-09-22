@@ -5977,13 +5977,15 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
         left outer join and a reversed anti join, combined with
         <literal>UNION ALL</literal>. The default is <literal>off</literal>.
         When enabled, this is a rule-based transformation, not a cost-based
-        alternative: both inputs can be scanned twice. At most eight full
-        joins are rewritten per statement.
+        alternative: each decomposition duplicates its inputs, and nested
+        decompositions can duplicate already expanded subtrees. At most
+        eight decomposition steps are performed per statement.
        </para>
        <para>
         Only read-only <command>SELECT</command> trees are considered.
         Volatile join conditions and inputs, lateral inputs, CTE references,
-        sampling, row security, security-barrier views, foreign tables,
+        sampling, row security, security-barrier views, foreign tables
+        (including inheritance and partition descendants),
         function inputs, domain coercions, unexpanded function defaults, and
         inputs with row locking, limits, aggregates, distinct clauses, set
         operations other than <literal>UNION ALL</literal>, window functions
