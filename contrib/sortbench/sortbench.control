@@ -1,0 +1,3 @@
+comment = 'Independent sort strategy experiment and EXPLAIN capture report'
+default_version = '1.0'
+relocatable = true

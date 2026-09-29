@@ -655,6 +655,22 @@
   ifdef => 'LOCK_DEBUG',
 },
 
+{ name => 'debug_disable_sort_bounded', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Disables the switch to bounded heapsort for sort experiments.',
+  long_desc => 'Preserves the bound hint and key preparation; normal memory growth and external sorting remain enabled.',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_EXPLAIN',
+  variable => 'debug_disable_sort_bounded',
+  boot_val => 'false',
+},
+
+{ name => 'debug_disable_sort_radix', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Disables radix sort dispatch for sort experiments.',
+  long_desc => 'Uses the existing quicksort fallback for eligible in-memory sorts and external runs.',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_EXPLAIN',
+  variable => 'debug_disable_sort_radix',
+  boot_val => 'false',
+},
+
 { name => 'debug_discard_caches', type => 'int', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Aggressively flush system caches for debugging purposes.',
   long_desc => '0 means use normal caching behavior.',

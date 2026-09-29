@@ -122,6 +122,8 @@
 
 /* GUC variables */
 bool		trace_sort = false;
+bool		debug_disable_sort_bounded = false;
+bool		debug_disable_sort_radix = false;
 
 #ifdef DEBUG_BOUNDED_SORT
 bool		optimize_bounded_sort = true;
@@ -1058,6 +1060,28 @@ noalloc:
 }
 
 /*
+ * Diagnostic snapshots of tuplesort's accounting, before tape/slab accounting
+ * takes over.  These are neither process RSS nor a memory-context high-water
+ * mark.  Array capacity can exceed the current tuple count or LIMIT bound.
+ */
+static void
+tuplesort_trace_memory(Tuplesortstate *state, const char *phase)
+{
+	int64		array_bytes = GetMemoryChunkSpace(state->memtuples);
+	int64		used_bytes = state->allowedMem - state->availMem;
+
+	Assert(!state->slabAllocatorUsed);
+	elog(LOG, "sortbench memory: phase=%s tuples=%d bound=%d capacity=%d "
+		 "slots_full=%d memory_full=%d allowed_bytes=" INT64_FORMAT
+		 " accounted_bytes=" INT64_FORMAT " array_bytes=" INT64_FORMAT
+		 " tuple_bytes=" INT64_FORMAT,
+		 phase, state->memtupcount, state->bounded ? state->bound : -1,
+		 state->memtupsize, state->memtupcount >= state->memtupsize,
+		 LACKMEM(state), state->allowedMem, used_bytes, array_bytes,
+		 used_bytes - array_bytes);
+}
+
+/*
  * Shared code for tuple and datum cases.
  */
 void
@@ -1133,7 +1157,7 @@ tuplesort_puttuple_common(Tuplesortstate *state, SortTuple *tuple,
 			 * tuples are larger than earlier ones, this might cause us to
 			 * exceed workMem significantly.
 			 */
-			if (state->bounded &&
+			if (state->bounded && !debug_disable_sort_bounded &&
 				(state->memtupcount > state->bound * 2 ||
 				 (state->memtupcount > state->bound && LACKMEM(state))))
 			{
@@ -1141,7 +1165,11 @@ tuplesort_puttuple_common(Tuplesortstate *state, SortTuple *tuple,
 					elog(LOG, "switching to bounded heapsort at %d tuples: %s",
 						 state->memtupcount,
 						 pg_rusage_show(&state->ru_start));
+				if (trace_sort)
+					tuplesort_trace_memory(state, "heap-input");
 				make_bounded_heap(state);
+				if (trace_sort)
+					tuplesort_trace_memory(state, "heap-ready");
 				MemoryContextSwitchTo(oldcontext);
 				return;
 			}
@@ -1158,6 +1186,8 @@ tuplesort_puttuple_common(Tuplesortstate *state, SortTuple *tuple,
 			/*
 			 * Nope; time to switch to tape-based operation.
 			 */
+			if (trace_sort)
+				tuplesort_trace_memory(state, "external-input");
 			inittapes(state, true);
 
 			/*
@@ -1274,6 +1304,8 @@ tuplesort_performsort(Tuplesortstate *state)
 			if (SERIAL(state))
 			{
 				/* Sort in memory and we're done */
+				if (trace_sort)
+					tuplesort_trace_memory(state, "full-input");
 				tuplesort_sort_memtuples(state);
 				state->status = TSS_SORTEDINMEM;
 			}
@@ -3007,12 +3039,16 @@ tuplesort_sort_memtuples(Tuplesortstate *state)
 			SortSupport ssup = &state->base.sortKeys[0];
 
 			/* Does it compare as an integer? */
-			if (state->memtupcount >= QSORT_THRESHOLD &&
+			if (!debug_disable_sort_radix &&
+				state->memtupcount >= QSORT_THRESHOLD &&
 				(ssup->comparator == ssup_datum_uint64_cmp ||
 				 ssup->comparator == ssup_datum_int64_cmp ||
 				 ssup->comparator == ssup_datum_uint32_cmp ||
 				 ssup->comparator == ssup_datum_int32_cmp))
 			{
+				if (trace_sort)
+					elog(LOG, "sortbench dispatch: radix-entry, tuples=%d",
+						 state->memtupcount);
 				radix_sort_tuple(state->memtuples,
 								 state->memtupcount,
 								 state);
@@ -3024,11 +3060,17 @@ tuplesort_sort_memtuples(Tuplesortstate *state)
 		/* Can we use the single-key sort function? */
 		if (state->base.onlyKey != NULL)
 		{
+			if (trace_sort)
+				elog(LOG, "sortbench dispatch: qsort-single, tuples=%d",
+					 state->memtupcount);
 			qsort_ssup(state->memtuples, state->memtupcount,
 					   state->base.onlyKey);
 		}
 		else
 		{
+			if (trace_sort)
+				elog(LOG, "sortbench dispatch: qsort-tuple, tuples=%d",
+					 state->memtupcount);
 			qsort_tuple(state->memtuples,
 						state->memtupcount,
 						state->base.comparetup,
