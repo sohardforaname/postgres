@@ -105,6 +105,7 @@
 #include "optimizer/plancat.h"
 #include "optimizer/restrictinfo.h"
 #include "parser/parsetree.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
 #include "utils/spccache.h"
@@ -2036,6 +2037,27 @@ cost_tuplesort(Cost *startup_cost, Cost *run_cost,
 	 * counting the LIMIT otherwise.
 	 */
 	*run_cost = cpu_operator_cost * tuples;
+
+	/* Diagnostic only: report the existing model, ignoring executor toggles. */
+	if (trace_sort)
+	{
+		const char *method;
+
+		if (output_bytes > sort_mem_bytes)
+			method = "external";
+		else if (tuples > 2 * output_tuples || input_bytes > sort_mem_bytes)
+			method = "bounded";
+		else
+			method = "full-memory";
+
+		elog(LOG, "sortbench cost: predicted=%s rows=%.0f width=%d "
+			 "limit=%.0f output_rows=%.0f input_bytes=%.0f output_bytes=%.0f "
+			 "allowed_bytes=" INT64_FORMAT " comparison_cost=%.6f "
+			 "sort_startup=%.6f sort_run=%.6f",
+			 method, tuples, width, limit_tuples, output_tuples,
+			 input_bytes, output_bytes, sort_mem_bytes, comparison_cost,
+			 *startup_cost, *run_cost);
+	}
 }
 
 /*

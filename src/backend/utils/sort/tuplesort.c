@@ -124,6 +124,7 @@
 bool		trace_sort = false;
 bool		debug_disable_sort_bounded = false;
 bool		debug_disable_sort_radix = false;
+bool		debug_sort_free_heap_root = false;
 
 #ifdef DEBUG_BOUNDED_SORT
 bool		optimize_bounded_sort = true;
@@ -2548,7 +2549,12 @@ make_bounded_heap(Tuplesortstate *state)
 				CHECK_FOR_INTERRUPTS();
 			}
 			else
+			{
+				/* Temporary A/B switch: replacement does not free the old root. */
+				if (debug_sort_free_heap_root)
+					free_sort_tuple(state, &state->memtuples[0]);
 				tuplesort_heap_replace_top(state, &state->memtuples[i]);
+			}
 		}
 	}
 

@@ -1,6 +1,15 @@
 -- Use a dedicated test database. The fixture is deliberately stored inline.
 CREATE FUNCTION sortbench_prepare() RETURNS SETOF text LANGUAGE plpgsql AS $prepare$
 BEGIN
+    IF EXISTS (SELECT FROM pg_settings WHERE name IN
+        ('enable_sort_tuple_width_cost','enable_cost_based_delayed_projection','enable_sort_datum_cost')) THEN
+        RAISE EXCEPTION 'Use the independent sorting branch';
+    END IF;
+    IF current_setting('debug_sort_free_heap_root',true) IS NULL OR
+       current_setting('debug_disable_sort_bounded',true) IS NULL OR
+       current_setting('debug_disable_sort_radix',true) IS NULL THEN
+        RAISE EXCEPTION 'Rebuild/install/restart with the heap A/B kernel patch first';
+    END IF;
     RETURN NEXT $command$
 DROP TABLE IF EXISTS public.sortbench_data;
 CREATE UNLOGGED TABLE public.sortbench_data (
@@ -15,6 +24,52 @@ ALTER TABLE public.sortbench_data ALTER COLUMN k SET STATISTICS 1000;
 ANALYZE public.sortbench_data;
 $command$;
     RETURN NEXT 'VACUUM public.sortbench_data;';
+    RETURN NEXT $fixtures$
+CREATE TEMP TABLE sortbench_cases(name text PRIMARY KEY,payload text,mem text,k integer);
+INSERT INTO sortbench_cases VALUES
+('narrow/32MB/k001000','narrow','32MB',1000),
+('narrow/32MB/k010000','narrow','32MB',10000),
+('narrow/32MB/k050000','narrow','32MB',50000),
+('narrow/32MB/k100000','narrow','32MB',100000),
+('narrow/32MB/k250000','narrow','32MB',250000),
+('narrow/32MB/k500000','narrow','32MB',500000),
+('narrow/32MB/k750000','narrow','32MB',750000),
+('narrow/1GB/k001000','narrow','1GB',1000),
+('narrow/1GB/k010000','narrow','1GB',10000),
+('narrow/1GB/k050000','narrow','1GB',50000),
+('narrow/1GB/k100000','narrow','1GB',100000),
+('narrow/1GB/k250000','narrow','1GB',250000),
+('narrow/1GB/k500000','narrow','1GB',500000),
+('narrow/1GB/k750000','narrow','1GB',750000),
+('wide/1GB/k001000','wide','1GB',1000),
+('wide/1GB/k010000','wide','1GB',10000),
+('wide/1GB/k050000','wide','1GB',50000),
+('wide/1GB/k100000','wide','1GB',100000),
+('wide/1GB/k250000','wide','1GB',250000),
+('wide/1GB/k500000','wide','1GB',500000),
+('wide/1GB/k750000','wide','1GB',750000),
+('narrow/4MB/k250000','narrow','4MB',250000),
+('narrow/8MB/k250000','narrow','8MB',250000),
+('narrow/16MB/k250000','narrow','16MB',250000),
+('narrow/24MB/k250000','narrow','24MB',250000),
+('wide/4MB/k250000','wide','4MB',250000),
+('wide/8MB/k250000','wide','8MB',250000),
+('wide/16MB/k250000','wide','16MB',250000),
+('wide/24MB/k250000','wide','24MB',250000),
+('wide/32MB/k250000','wide','32MB',250000);
+CREATE TEMP TABLE sortbench_heap_ascending(k integer NOT NULL,payload integer NOT NULL);
+INSERT INTO sortbench_heap_ascending SELECT k,-k FROM
+    (SELECT g,g AS k FROM generate_series(0,8192) g) s ORDER BY g;
+ANALYZE sortbench_heap_ascending;
+CREATE TEMP TABLE sortbench_heap_descending(k integer NOT NULL,payload integer NOT NULL);
+INSERT INTO sortbench_heap_descending SELECT k,-k FROM
+    (SELECT g,8192-g AS k FROM generate_series(0,8192) g) s ORDER BY g;
+ANALYZE sortbench_heap_descending;
+CREATE TEMP TABLE sortbench_heap_permuted(k integer NOT NULL,payload integer NOT NULL);
+INSERT INTO sortbench_heap_permuted SELECT k,-k FROM
+    (SELECT g,((g::bigint*48271)%8193)::integer AS k FROM generate_series(0,8192) g) s ORDER BY g;
+ANALYZE sortbench_heap_permuted;
+    $fixtures$;
 END $prepare$;
 
 CREATE FUNCTION sortbench_capture_begin(expected_samples integer DEFAULT NULL)
@@ -48,7 +103,7 @@ BEGIN
         'parallel_tuple_cost','seq_page_cost','random_page_cost','effective_cache_size',
         'effective_io_concurrency','maintenance_io_concurrency','shared_buffers',
         'cursor_tuple_fraction','default_statistics_target','synchronize_seqscans',
-        'debug_disable_sort_bounded','debug_disable_sort_radix',
+        'debug_disable_sort_bounded','debug_disable_sort_radix','debug_sort_free_heap_root',
         'trace_sort','search_path');
     RETURN 'SORTBENCH ' || jsonb_build_object('event','sample','run',s.run_id,'seq',s.seq,
         'case',case_name,'variant',variant,'check',check_name,'kind',sample_kind,
@@ -225,27 +280,6 @@ BEGIN
     ORDER BY s.case_name,s.variant;
 END $$;
 
-CREATE FUNCTION sortbench_file_ratios() RETURNS TABLE(
-    case_name text, comparison text, paired_batches bigint, median_ratio numeric,
-    faster_batches bigint, slower_batches bigint)
-LANGUAGE plpgsql AS $$
-BEGIN
-    PERFORM sortbench_file_ready();
-    RETURN QUERY
-    WITH pairs(num,den) AS (VALUES
-        ('no-heap','default'),('no-heap-no-radix','no-heap')),
-    r AS (
-        SELECT a.case_name,p.num||' / '||p.den AS label,a.ms/b.ms AS ratio
-        FROM pairs p JOIN pg_temp.sortbench_file_batches a ON a.variant=p.num
-        JOIN pg_temp.sortbench_file_batches b ON b.variant=p.den AND b.case_name=a.case_name
-                                             AND b.batch=a.batch AND b.n=a.n
-        WHERE b.ms>0
-    ) SELECT r.case_name,r.label,count(*),
-       round((percentile_cont(0.5) WITHIN GROUP (ORDER BY r.ratio))::numeric,3),
-       count(*) FILTER (WHERE r.ratio<0.95),count(*) FILTER (WHERE r.ratio>1.05)
-      FROM r GROUP BY r.case_name,r.label ORDER BY r.case_name,r.label;
-END $$;
-
 -- Compare planner-visible fields, stripping runtime counters from ANALYZE plans.
 CREATE FUNCTION sortbench_file_estimate(node jsonb) RETURNS jsonb
 LANGUAGE plpgsql IMMUTABLE STRICT AS $$
@@ -265,53 +299,6 @@ BEGIN
     RETURN result;
 END $$;
 
-
-CREATE FUNCTION sortbench_file_checks() RETURNS TABLE(case_name text, status text)
-LANGUAGE plpgsql AS $$
-DECLARE c record; s record; p jsonb; a jsonb; first_plan jsonb;
-BEGIN
-    PERFORM sortbench_file_ready();
-    FOR c IN SELECT f.case_name,count(DISTINCT f.variant) AS variants
-        FROM pg_temp.sortbench_file_samples f GROUP BY f.case_name ORDER BY f.case_name LOOP
-        case_name := c.case_name;
-        status := 'OK: same estimates, serial two-column Sort, 1M input, 250k output';
-        first_plan := NULL;
-        IF c.variants <> 2 THEN status := 'FAIL: expected two variants'; RETURN NEXT; CONTINUE; END IF;
-        FOR s IN SELECT * FROM pg_temp.sortbench_file_samples f WHERE f.case_name=c.case_name LOOP
-            p := sortbench_file_estimate(s.plan#>'{0,Plan}');
-            IF first_plan IS NOT NULL AND p IS DISTINCT FROM first_plan THEN
-                status := 'FAIL: planner fields changed across execution-only toggles';
-            END IF;
-            first_plan := p;
-            a := s.plan#>'{0,Plan,Plans,0}';
-            IF s.plan#>>'{0,Plan,Node Type}' IS DISTINCT FROM 'Limit'
-                OR (s.plan#>>'{0,Plan,Actual Rows}')::numeric IS DISTINCT FROM 250000
-                OR a->>'Node Type' IS DISTINCT FROM 'Sort'
-                OR (a->>'Actual Loops')::numeric IS DISTINCT FROM 1
-                OR jsonb_array_length(a->'Sort Key') IS DISTINCT FROM 1
-                OR a#>>'{Plans,0,Node Type}' IS DISTINCT FROM 'Seq Scan'
-                OR (a#>>'{Plans,0,Actual Rows}')::numeric IS DISTINCT FROM 1000000
-                OR (a#>>'{Plans,0,Actual Loops}')::numeric IS DISTINCT FROM 1
-                OR jsonb_array_length(a#>'{Plans,0,Output}') IS DISTINCT FROM 2 THEN
-                status := 'FAIL: unexpected query shape or row counts';
-            END IF;
-            IF s.settings->>'debug_disable_sort_bounded'='on'
-               AND a->>'Sort Method'='top-N heapsort' THEN
-                status := 'FAIL: heap used while disabled';
-            END IF;
-            IF (s.settings->>'debug_disable_sort_bounded') IS DISTINCT FROM
-                  (CASE WHEN s.variant='default' THEN 'off' ELSE 'on' END)
-               OR (s.settings->>'debug_disable_sort_radix') IS DISTINCT FROM
-                  (CASE WHEN s.variant='no-heap-no-radix' THEN 'on' ELSE 'off' END)
-               OR s.settings->>'trace_sort' IS DISTINCT FROM 'off'
-               OR s.settings->>'max_parallel_workers_per_gather' IS DISTINCT FROM '0'
-               OR s.settings->>'jit' IS DISTINCT FROM 'off' THEN
-                status := 'FAIL: unexpected diagnostic/timing settings';
-            END IF;
-        END LOOP;
-        RETURN NEXT;
-    END LOOP;
-END $$;
 
 -- Incremental estimated Sort costs; runtime remains whole-query Execution Time.
 CREATE FUNCTION sortbench_file_costs() RETURNS TABLE(
@@ -333,4 +320,171 @@ BEGIN
     FROM pg_temp.sortbench_file_samples s JOIN pg_temp.sortbench_file_nodes n USING(sample_id)
     WHERE s.kind='timed' AND n.node->>'Node Type'='Sort'
     GROUP BY s.case_name,s.variant ORDER BY s.case_name,s.variant;
+END $$;
+-- Round 2 uses the existing parser and report, with a four-strategy manifest.
+CREATE FUNCTION sortbench_file_checks() RETURNS TABLE(case_name text, status text)
+LANGUAGE plpgsql AS $$
+DECLARE v text; c record; s record; p jsonb; a jsonb; first_plan jsonb; expected_settings jsonb;
+BEGIN
+    PERFORM sortbench_file_ready();
+    FOR c IN SELECT * FROM pg_temp.sortbench_cases ORDER BY name LOOP
+        case_name := c.name;
+        status := 'OK: eight variants, four timed batches, one warmup; estimates/shape/settings match';
+        first_plan := NULL;
+        expected_settings := NULL;
+        IF (SELECT count(*) FROM pg_temp.sortbench_file_samples f WHERE f.case_name=c.name) <> 40
+           OR (SELECT count(DISTINCT f.variant) FROM pg_temp.sortbench_file_samples f WHERE f.case_name=c.name) <> 8
+           OR EXISTS (
+               SELECT FROM pg_temp.sortbench_file_samples f WHERE f.case_name=c.name
+               GROUP BY f.variant HAVING count(*) FILTER (WHERE kind='warmup' AND batch=1) <> 1
+                 OR count(*) FILTER (WHERE kind='timed') <> 4
+                 OR count(DISTINCT batch) FILTER (WHERE kind='timed' AND batch BETWEEN 1 AND 4) <> 4
+           ) THEN status := 'FAIL: incomplete or duplicate samples'; END IF;
+        FOR s IN SELECT * FROM pg_temp.sortbench_file_samples f WHERE f.case_name=c.name LOOP
+            p := sortbench_file_estimate(s.plan#>'{0,Plan}');
+            IF first_plan IS NOT NULL AND p IS DISTINCT FROM first_plan THEN
+                status := 'FAIL: planner fields changed across execution-only toggles';
+            END IF;
+            first_plan := p;
+            p := s.settings - 'debug_disable_sort_bounded' - 'debug_disable_sort_radix' - 'debug_sort_free_heap_root';
+            v := split_part(s.variant,'/',2);
+            IF expected_settings IS NOT NULL AND p IS DISTINCT FROM expected_settings THEN
+                status := 'FAIL: other captured settings changed';
+            END IF;
+            expected_settings := p;
+            a := s.plan#>'{0,Plan,Plans,0}';
+            IF s.plan#>>'{0,Plan,Node Type}' IS DISTINCT FROM 'Limit'
+               OR (s.plan#>>'{0,Plan,Actual Rows}')::numeric IS DISTINCT FROM c.k
+               OR (s.plan#>>'{0,Plan,Plan Rows}')::numeric IS DISTINCT FROM c.k
+               OR a->>'Node Type' IS DISTINCT FROM 'Sort'
+               OR (a->>'Actual Loops')::numeric IS DISTINCT FROM 1
+               OR jsonb_array_length(a->'Sort Key') IS DISTINCT FROM 1
+               OR a#>>'{Plans,0,Node Type}' IS DISTINCT FROM 'Seq Scan'
+               OR (a#>>'{Plans,0,Actual Rows}')::numeric IS DISTINCT FROM 1000000
+               OR (a#>>'{Plans,0,Plan Rows}')::numeric IS DISTINCT FROM 1000000
+               OR (a#>>'{Plans,0,Actual Loops}')::numeric IS DISTINCT FROM 1
+               OR jsonb_array_length(a#>'{Plans,0,Output}') IS DISTINCT FROM 2
+               OR a#>>'{Plans,0,Relation Name}' IS DISTINCT FROM 'sortbench_data' THEN
+                status := 'FAIL: unexpected plan shape or row estimates/actuals';
+            END IF;
+            IF s.settings->>'debug_disable_sort_bounded'='on' AND a->>'Sort Method'='top-N heapsort' THEN
+                status := 'FAIL: heap used while disabled';
+            END IF;
+            IF v NOT IN ('default','no-radix','no-heap','no-heap-no-radix')
+               OR (s.settings->>'debug_disable_sort_bounded') IS DISTINCT FROM
+                  (CASE WHEN v IN ('no-heap','no-heap-no-radix') THEN 'on' ELSE 'off' END)
+               OR (s.settings->>'debug_disable_sort_radix') IS DISTINCT FROM
+                  (CASE WHEN v IN ('no-radix','no-heap-no-radix') THEN 'on' ELSE 'off' END)
+               OR split_part(s.variant,'/',1) NOT IN ('off','on')
+               OR (s.settings->>'debug_sort_free_heap_root') IS DISTINCT FROM split_part(s.variant,'/',1)
+               OR pg_size_bytes(s.settings->>'work_mem') IS DISTINCT FROM pg_size_bytes(c.mem)
+               OR s.settings->>'trace_sort' IS DISTINCT FROM 'off'
+               OR s.settings->>'max_parallel_workers_per_gather' IS DISTINCT FROM '0'
+               OR s.settings->>'jit' IS DISTINCT FROM 'off'
+               OR s.settings->>'synchronize_seqscans' IS DISTINCT FROM 'off' THEN
+                status := 'FAIL: unexpected strategy or timing settings';
+            END IF;
+        END LOOP;
+        RETURN NEXT;
+    END LOOP;
+    IF EXISTS (SELECT FROM pg_temp.sortbench_file_samples f WHERE f.check_name <> 'heap-release' AND NOT EXISTS
+               (SELECT FROM pg_temp.sortbench_cases m WHERE m.name=f.case_name)) THEN
+        case_name := 'unexpected-case'; status := 'FAIL: captured case missing from manifest'; RETURN NEXT;
+    END IF;
+END $$;
+
+
+-- The query is written literally in benchmark.sql; this only validates its array.
+CREATE FUNCTION sortbench_assert_result(actual text[], tuple_mode boolean)
+RETURNS text LANGUAGE plpgsql AS $$
+DECLARE expected text[];
+BEGIN
+    SELECT array_agg(CASE WHEN tuple_mode THEN format('(%s,%s)',g,-g)
+                         ELSE g::text END ORDER BY g) INTO expected
+    FROM generate_series(0,4095) g;
+    IF actual IS DISTINCT FROM expected THEN
+        RAISE EXCEPTION 'Wrong ordered keys/payloads with heap release %',
+                        current_setting('debug_sort_free_heap_root');
+    END IF;
+    RETURN 'OK: 4096 ordered keys/payloads';
+END $$;
+
+CREATE FUNCTION sortbench_heap_checks() RETURNS TABLE(
+    case_name text, release_mode text, method text, memory_kb integer, status text)
+LANGUAGE plpgsql AS $$
+DECLARE s record; a jsonb; ncols integer; ref_kb integer;
+BEGIN
+    PERFORM sortbench_file_ready();
+    IF (SELECT count(*) FROM pg_temp.sortbench_file_samples f WHERE f.check_name='heap-release')<>12
+       OR (SELECT count(DISTINCT (f.case_name,f.variant)) FROM pg_temp.sortbench_file_samples f
+           WHERE f.check_name='heap-release')<>12 THEN
+        RAISE EXCEPTION 'Expected 12 distinct heap-release diagnostic plans';
+    END IF;
+    FOR s IN SELECT * FROM pg_temp.sortbench_file_samples f
+             WHERE f.check_name='heap-release' ORDER BY f.case_name,f.variant LOOP
+        case_name := s.case_name; release_mode := s.variant;
+        ncols := CASE WHEN split_part(s.case_name,'/',2)='datum' THEN 1 ELSE 2 END;
+        a := s.plan#>'{0,Plan,Plans,0}';
+        method := a->>'Sort Method'; memory_kb := (a->>'Sort Space Used')::integer;
+        IF s.case_name NOT IN ('heap-check/datum/ascending','heap-check/datum/descending','heap-check/datum/permuted',
+                              'heap-check/tuple/ascending','heap-check/tuple/descending','heap-check/tuple/permuted')
+           OR s.variant NOT IN ('off','on') OR s.kind<>'diagnostic'
+           OR s.settings->>'debug_sort_free_heap_root' IS DISTINCT FROM s.variant
+           OR s.settings->>'debug_disable_sort_bounded' IS DISTINCT FROM 'off'
+           OR s.settings->>'debug_disable_sort_radix' IS DISTINCT FROM 'off'
+           OR s.settings->>'max_parallel_workers_per_gather' IS DISTINCT FROM '0'
+           OR s.settings->>'jit' IS DISTINCT FROM 'off'
+           OR s.settings->>'trace_sort' IS DISTINCT FROM 'off'
+           OR pg_size_bytes(s.settings->>'work_mem') IS DISTINCT FROM pg_size_bytes('64MB')
+           OR s.plan#>>'{0,Plan,Node Type}' IS DISTINCT FROM 'Limit'
+           OR (s.plan#>>'{0,Plan,Actual Rows}')::numeric IS DISTINCT FROM 4096
+           OR method IS DISTINCT FROM 'top-N heapsort'
+           OR (a->>'Actual Loops')::numeric IS DISTINCT FROM 1
+           OR a->>'Sort Space Type' IS DISTINCT FROM 'Memory'
+           OR (a#>>'{Plans,0,Actual Rows}')::numeric IS DISTINCT FROM 8193
+           OR a#>>'{Plans,0,Node Type}' IS DISTINCT FROM 'Seq Scan'
+           OR jsonb_array_length(a#>'{Plans,0,Output}') IS DISTINCT FROM ncols THEN
+            RAISE EXCEPTION 'Unexpected heap-check shape/settings for %/%',s.case_name,s.variant;
+        END IF;
+        SELECT (f.plan#>>'{0,Plan,Plans,0,Sort Space Used}')::integer INTO STRICT ref_kb
+        FROM pg_temp.sortbench_file_samples f
+        WHERE f.case_name='heap-check/'||split_part(s.case_name,'/',2)||'/ascending'
+          AND f.variant=s.variant;
+        IF s.variant='on' AND memory_kb<>ref_kb THEN
+            RAISE EXCEPTION 'Fixed heap memory depends on input order: % (% vs % kB)',s.case_name,memory_kb,ref_kb;
+        END IF;
+        status := CASE WHEN s.variant='on' THEN 'OK: memory matches ascending control'
+                       ELSE format('baseline: %s kB extra vs ascending',memory_kb-ref_kb) END;
+        RETURN NEXT;
+    END LOOP;
+END $$;
+
+CREATE FUNCTION sortbench_file_ratios() RETURNS TABLE(
+    case_name text, scope text, comparison text, paired_batches bigint,
+    median_ratio numeric, min_ratio numeric, max_ratio numeric,
+    faster_batches bigint, slower_batches bigint)
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM sortbench_file_ready();
+    RETURN QUERY
+    WITH strategies(v) AS (VALUES ('default'),('no-radix'),('no-heap'),('no-heap-no-radix')),
+    algorithm_pairs(num,den) AS (VALUES
+        ('no-heap','default'),('no-heap-no-radix','no-radix'),
+        ('no-radix','default'),('no-heap-no-radix','no-heap')),
+    pairs(scope,num,den) AS (
+        SELECT 'release','on/'||v,'off/'||v FROM strategies
+        UNION ALL
+        SELECT 'strategy',mode||'/'||num,mode||'/'||den
+        FROM algorithm_pairs CROSS JOIN (VALUES ('off'),('on')) m(mode)
+    ), r AS (
+        SELECT a.case_name,p.scope,p.num||' / '||p.den AS label,a.ms/b.ms AS ratio
+        FROM pairs p JOIN pg_temp.sortbench_file_batches a ON a.variant=p.num
+        JOIN pg_temp.sortbench_file_batches b ON b.variant=p.den
+            AND b.case_name=a.case_name AND b.batch=a.batch
+        WHERE a.n=1 AND b.n=1 AND b.ms>0
+    ) SELECT r.case_name,r.scope,r.label,count(*),
+        round((percentile_cont(0.5) WITHIN GROUP (ORDER BY r.ratio))::numeric,3),
+        round(min(r.ratio)::numeric,3),round(max(r.ratio)::numeric,3),
+        count(*) FILTER (WHERE r.ratio<0.95),count(*) FILTER (WHERE r.ratio>1.05)
+      FROM r GROUP BY r.case_name,r.scope,r.label ORDER BY r.case_name,r.scope,r.label;
 END $$;
