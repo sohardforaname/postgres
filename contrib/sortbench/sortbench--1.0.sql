@@ -5,10 +5,11 @@ BEGIN
         ('enable_sort_tuple_width_cost','enable_cost_based_delayed_projection','enable_sort_datum_cost')) THEN
         RAISE EXCEPTION 'Use the independent sorting branch';
     END IF;
-    IF current_setting('debug_sort_free_heap_root',true) IS NULL OR
+    IF current_setting('debug_sort_heap_on_slots',true) IS NULL OR
+       current_setting('debug_sort_free_heap_root',true) IS NULL OR
        current_setting('debug_disable_sort_bounded',true) IS NULL OR
        current_setting('debug_disable_sort_radix',true) IS NULL THEN
-        RAISE EXCEPTION 'Rebuild/install/restart with the heap A/B kernel patch first';
+        RAISE EXCEPTION 'Rebuild/install/restart with the round-05 slots A/B kernel patch first';
     END IF;
     RETURN NEXT $command$
 DROP TABLE IF EXISTS public.sortbench_data;
@@ -57,6 +58,78 @@ INSERT INTO sortbench_cases VALUES
 ('wide/16MB/k250000','wide','16MB',250000),
 ('wide/24MB/k250000','wide','24MB',250000),
 ('wide/32MB/k250000','wide','32MB',250000);
+
+CREATE TEMP TABLE sortbench_boundary_cases(
+    name text PRIMARY KEY, payload text NOT NULL, mem text NOT NULL,
+    k integer NOT NULL, variants text[] NOT NULL);
+INSERT INTO sortbench_boundary_cases VALUES
+('boundary/narrow/16MB/k250000','narrow','16MB',250000,ARRAY['on/default','on/no-heap']),
+('boundary/narrow/24MB/k250000','narrow','24MB',250000,ARRAY['on/default','on/no-heap']),
+('boundary/narrow/28MB/k250000','narrow','28MB',250000,ARRAY['on/default','on/no-heap','off/default']),
+('boundary/narrow/29MB/k250000','narrow','29MB',250000,ARRAY['on/default','on/no-heap']),
+('boundary/narrow/30MB/k250000','narrow','30MB',250000,ARRAY['on/default','on/no-heap']),
+('boundary/narrow/31232kB/k250000','narrow','31232kB',250000,ARRAY['on/default','on/no-heap']),
+('boundary/narrow/31MB/k250000','narrow','31MB',250000,ARRAY['on/default','on/no-heap']),
+('boundary/narrow/32256kB/k250000','narrow','32256kB',250000,ARRAY['on/default','on/no-heap']),
+('boundary/narrow/32MB/k250000','narrow','32MB',250000,ARRAY['on/default','on/no-heap','off/default']),
+('boundary/narrow/33MB/k250000','narrow','33MB',250000,ARRAY['on/default','on/no-heap']),
+('boundary/narrow/36MB/k250000','narrow','36MB',250000,ARRAY['on/default','on/no-heap']),
+('boundary/narrow/64MB/k250000','narrow','64MB',250000,ARRAY['on/default','on/no-heap']),
+('boundary/narrow/1GB/k250000','narrow','1GB',250000,ARRAY['on/default','on/no-heap']),
+('boundary/wide/64MB/k250000','wide','64MB',250000,ARRAY['on/default','on/no-heap']),
+('boundary/wide/96MB/k250000','wide','96MB',250000,ARRAY['on/default','on/no-heap']),
+('boundary/wide/128MB/k250000','wide','128MB',250000,ARRAY['on/default','on/no-heap']),
+('boundary/wide/144MB/k250000','wide','144MB',250000,ARRAY['on/default','on/no-heap']),
+('boundary/wide/192MB/k250000','wide','192MB',250000,ARRAY['on/default','on/no-heap']),
+('boundary/wide/256MB/k250000','wide','256MB',250000,ARRAY['on/default','on/no-heap']),
+('boundary/wide/272MB/k250000','wide','272MB',250000,ARRAY['on/default','on/no-heap']),
+('boundary/wide/1GB/k250000','wide','1GB',250000,ARRAY['on/default','on/no-heap','off/default']);
+
+CREATE TEMP TABLE sortbench_slots_cases(
+    name text PRIMARY KEY, payload text, mem text, k integer, variants text[]);
+INSERT INTO sortbench_slots_cases VALUES
+('slots/narrow/16MB/k250000','narrow','16MB',250000,ARRAY['off/default','on/default','off/no-radix','on/no-radix','off/no-heap','on/no-heap']),
+('slots/narrow/24MB/k250000','narrow','24MB',250000,ARRAY['off/default','on/default','off/no-radix','on/no-radix']),
+('slots/narrow/28MB/k250000','narrow','28MB',250000,ARRAY['off/default','on/default','off/no-radix','on/no-radix']),
+('slots/narrow/29MB/k250000','narrow','29MB',250000,ARRAY['off/default','on/default','off/no-radix','on/no-radix']),
+('slots/narrow/30MB/k250000','narrow','30MB',250000,ARRAY['off/default','on/default','off/no-radix','on/no-radix']),
+('slots/narrow/31232kB/k250000','narrow','31232kB',250000,ARRAY['off/default','on/default','off/no-radix','on/no-radix']),
+('slots/narrow/31MB/k250000','narrow','31MB',250000,ARRAY['off/default','on/default']),
+('slots/narrow/32256kB/k250000','narrow','32256kB',250000,ARRAY['off/default','on/default']),
+('slots/narrow/32MB/k250000','narrow','32MB',250000,ARRAY['off/default','on/default','off/no-heap','on/no-heap']),
+('slots/narrow/33MB/k250000','narrow','33MB',250000,ARRAY['off/default','on/default']),
+('slots/narrow/36MB/k250000','narrow','36MB',250000,ARRAY['off/default','on/default']),
+('slots/narrow/64MB/k250000','narrow','64MB',250000,ARRAY['off/default','on/default']),
+('slots/narrow/1GB/k250000','narrow','1GB',250000,ARRAY['off/default','on/default']),
+('slots/wide/64MB/k250000','wide','64MB',250000,ARRAY['off/default','on/default']),
+('slots/wide/96MB/k250000','wide','96MB',250000,ARRAY['off/default','on/default']),
+('slots/wide/128MB/k250000','wide','128MB',250000,ARRAY['off/default','on/default']),
+('slots/wide/144MB/k250000','wide','144MB',250000,ARRAY['off/default','on/default','off/no-radix','on/no-radix','off/no-heap','on/no-heap']),
+('slots/wide/192MB/k250000','wide','192MB',250000,ARRAY['off/default','on/default','off/no-radix','on/no-radix']),
+('slots/wide/256MB/k250000','wide','256MB',250000,ARRAY['off/default','on/default','off/no-radix','on/no-radix']),
+('slots/wide/272MB/k250000','wide','272MB',250000,ARRAY['off/default','on/default']),
+('slots/wide/1GB/k250000','wide','1GB',250000,ARRAY['off/default','on/default']);
+CREATE TEMP TABLE sortbench_slots_nulls(k integer,payload integer NOT NULL);
+INSERT INTO sortbench_slots_nulls
+SELECT CASE WHEN g%37=0 THEN NULL ELSE g%101 END,g
+FROM generate_series(8192,0,-1) g;
+ANALYZE sortbench_slots_nulls;
+CREATE TEMP TABLE sortbench_slots_small(
+    name text PRIMARY KEY, representation text, relation_name text,
+    k integer, offset_rows integer, nkeys integer);
+INSERT INTO sortbench_slots_small VALUES
+('slots-check/datum/ascending/k3500','datum','sortbench_heap_ascending',3500,0,1),
+('slots-check/datum/descending/k3500','datum','sortbench_heap_descending',3500,0,1),
+('slots-check/datum/permuted/k3500','datum','sortbench_heap_permuted',3500,0,1),
+('slots-check/tuple/ascending/k1200','tuple','sortbench_heap_ascending',1200,0,1),
+('slots-check/tuple/descending/k1200','tuple','sortbench_heap_descending',1200,0,1),
+('slots-check/tuple/permuted/k1200','tuple','sortbench_heap_permuted',1200,0,1),
+('slots-check/tuple/edge/k2046','tuple','sortbench_heap_permuted',2046,0,1),
+('slots-check/tuple/edge/k2047','tuple','sortbench_heap_permuted',2047,0,1),
+('slots-check/tuple/edge/k2048','tuple','sortbench_heap_permuted',2048,0,1),
+('slots-check/tuple/offset','tuple','sortbench_heap_descending',1000,200,1),
+('slots-check/nulls-first','nulls-first','sortbench_slots_nulls',1200,0,2),
+('slots-check/nulls-last','nulls-last','sortbench_slots_nulls',1200,0,2);
 CREATE TEMP TABLE sortbench_heap_ascending(k integer NOT NULL,payload integer NOT NULL);
 INSERT INTO sortbench_heap_ascending SELECT k,-k FROM
     (SELECT g,g AS k FROM generate_series(0,8192) g) s ORDER BY g;
@@ -104,6 +177,7 @@ BEGIN
         'effective_io_concurrency','maintenance_io_concurrency','shared_buffers',
         'cursor_tuple_fraction','default_statistics_target','synchronize_seqscans',
         'debug_disable_sort_bounded','debug_disable_sort_radix','debug_sort_free_heap_root',
+        'debug_sort_heap_on_slots',
         'trace_sort','search_path');
     RETURN 'SORTBENCH ' || jsonb_build_object('event','sample','run',s.run_id,'seq',s.seq,
         'case',case_name,'variant',variant,'check',check_name,'kind',sample_kind,
@@ -487,4 +561,285 @@ BEGIN
         round(min(r.ratio)::numeric,3),round(max(r.ratio)::numeric,3),
         count(*) FILTER (WHERE r.ratio<0.95),count(*) FILTER (WHERE r.ratio>1.05)
       FROM r GROUP BY r.case_name,r.scope,r.label ORDER BY r.case_name,r.scope,r.label;
+END $$;
+
+-- Round 04: report-only diagnostics; no EXPLAIN cost is treated as milliseconds.
+CREATE FUNCTION sortbench_boundary_check() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE c record; s record; a jsonb; p jsonb;
+        first_plan jsonb; first_settings jsonb; expected_count integer;
+BEGIN
+    PERFORM sortbench_file_ready();
+    SELECT sum(cardinality(m.variants)*2)::integer INTO expected_count
+    FROM pg_temp.sortbench_boundary_cases m;
+    IF (SELECT count(*) FROM pg_temp.sortbench_file_samples f
+        WHERE f.check_name='boundary') IS DISTINCT FROM expected_count
+       OR EXISTS (SELECT FROM pg_temp.sortbench_file_samples f
+                  WHERE f.check_name NOT IN ('boundary','heap-release')) THEN
+        RAISE EXCEPTION 'Boundary sample count or check labels do not match manifest';
+    END IF;
+    IF EXISTS (
+        SELECT FROM pg_temp.sortbench_file_samples f
+        WHERE f.check_name='boundary' AND NOT EXISTS (
+            SELECT FROM pg_temp.sortbench_boundary_cases m
+            WHERE m.name=f.case_name AND f.variant=ANY(m.variants))) THEN
+        RAISE EXCEPTION 'Unknown boundary case or variant';
+    END IF;
+    FOR c IN SELECT * FROM pg_temp.sortbench_boundary_cases m ORDER BY m.name LOOP
+        IF EXISTS (
+            SELECT FROM unnest(c.variants) AS v(variant)
+            CROSS JOIN generate_series(1,2) AS b(batch)
+            WHERE (SELECT count(*) FROM pg_temp.sortbench_file_samples f
+                   WHERE f.check_name='boundary' AND f.case_name=c.name
+                     AND f.variant=v.variant AND f.batch=b.batch
+                     AND f.kind='diagnostic') <> 1) THEN
+            RAISE EXCEPTION 'Missing or duplicate boundary sample: %',c.name;
+        END IF;
+        first_plan := NULL;
+        first_settings := NULL;
+        FOR s IN SELECT * FROM pg_temp.sortbench_file_samples f
+                 WHERE f.check_name='boundary' AND f.case_name=c.name LOOP
+            p := sortbench_file_estimate(s.plan#>'{0,Plan}');
+            IF first_plan IS NOT NULL AND p IS DISTINCT FROM first_plan THEN
+                RAISE EXCEPTION 'Planner fields changed within boundary case: %',c.name;
+            END IF;
+            first_plan := p;
+            p := s.settings - 'debug_disable_sort_bounded' - 'debug_sort_free_heap_root';
+            IF first_settings IS NOT NULL AND p IS DISTINCT FROM first_settings THEN
+                RAISE EXCEPTION 'Other settings changed within boundary case: %',c.name;
+            END IF;
+            first_settings := p;
+            a := s.plan#>'{0,Plan,Plans,0}';
+            IF s.plan#>>'{0,Plan,Node Type}' IS DISTINCT FROM 'Limit'
+               OR (s.plan#>>'{0,Plan,Actual Rows}')::numeric IS DISTINCT FROM c.k
+               OR (s.plan#>>'{0,Plan,Plan Rows}')::numeric IS DISTINCT FROM c.k
+               OR (s.plan#>>'{0,Plan,Actual Loops}')::numeric IS DISTINCT FROM 1
+               OR a->>'Node Type' IS DISTINCT FROM 'Sort'
+               OR (a->>'Actual Loops')::numeric IS DISTINCT FROM 1
+               OR jsonb_array_length(a->'Sort Key') IS DISTINCT FROM 1
+               OR a#>>'{Plans,0,Node Type}' IS DISTINCT FROM 'Seq Scan'
+               OR a#>>'{Plans,0,Relation Name}' IS DISTINCT FROM 'sortbench_data'
+               OR (a#>>'{Plans,0,Actual Rows}')::numeric IS DISTINCT FROM 1000000
+               OR (a#>>'{Plans,0,Plan Rows}')::numeric IS DISTINCT FROM 1000000
+               OR (a#>>'{Plans,0,Actual Loops}')::numeric IS DISTINCT FROM 1
+               OR jsonb_array_length(a#>'{Plans,0,Output}') IS DISTINCT FROM 2
+               OR (a->>'Actual Rows')::numeric IS DISTINCT FROM c.k
+               OR coalesce(a->>'Sort Method','') NOT IN
+                   ('top-N heapsort','quicksort','external sort','external merge')
+               OR coalesce(a->>'Sort Space Type','') NOT IN ('Memory','Disk') THEN
+                RAISE EXCEPTION 'Unexpected boundary plan shape: %/%',c.name,s.variant;
+            END IF;
+            IF s.settings->>'debug_disable_sort_bounded' IS DISTINCT FROM
+                   (CASE WHEN split_part(s.variant,'/',2)='no-heap' THEN 'on' ELSE 'off' END)
+               OR s.settings->>'debug_sort_free_heap_root' IS DISTINCT FROM split_part(s.variant,'/',1)
+               OR s.settings->>'debug_disable_sort_radix' IS DISTINCT FROM 'off'
+               OR s.settings->>'max_parallel_workers_per_gather' IS DISTINCT FROM '0'
+               OR s.settings->>'max_parallel_workers' IS DISTINCT FROM '0'
+               OR s.settings->>'jit' IS DISTINCT FROM 'off'
+               OR s.settings->>'synchronize_seqscans' IS DISTINCT FROM 'off'
+               OR s.settings->>'trace_sort' IS DISTINCT FROM 'on'
+               OR pg_size_bytes(s.settings->>'work_mem') IS DISTINCT FROM pg_size_bytes(c.mem)
+               OR (split_part(s.variant,'/',2)='no-heap' AND a->>'Sort Method'='top-N heapsort') THEN
+                RAISE EXCEPTION 'Unexpected boundary settings/method: %/%',c.name,s.variant;
+            END IF;
+        END LOOP;
+    END LOOP;
+    RETURN format('OK: %s boundary plans; two diagnostic repeats per case/variant',expected_count);
+END $$;
+
+CREATE FUNCTION sortbench_boundary_report() RETURNS TABLE(
+    case_name text, variant text, samples bigint, estimated_rows numeric,
+    estimated_width integer, allowed_bytes bigint, methods text,
+    space_type text, min_space_kb integer, max_space_kb integer,
+    sort_startup_added numeric, sort_run_cost numeric,
+    min_temp_read bigint, max_temp_read bigint,
+    min_temp_written bigint, max_temp_written bigint)
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM sortbench_boundary_check();
+    RETURN QUERY
+    WITH d AS (
+        SELECT f.*, f.plan#>'{0,Plan,Plans,0}' AS a
+        FROM pg_temp.sortbench_file_samples f WHERE f.check_name='boundary'
+    )
+    SELECT d.case_name,d.variant,count(*),
+        min((d.a#>>'{Plans,0,Plan Rows}')::numeric),
+        min((d.a->>'Plan Width')::integer),
+        min(pg_size_bytes(d.settings->>'work_mem')),
+        string_agg(DISTINCT d.a->>'Sort Method','/'),
+        string_agg(DISTINCT d.a->>'Sort Space Type','/'),
+        min((d.a->>'Sort Space Used')::integer),max((d.a->>'Sort Space Used')::integer),
+        min((d.a->>'Startup Cost')::numeric - (d.a#>>'{Plans,0,Total Cost}')::numeric),
+        min((d.a->>'Total Cost')::numeric - (d.a->>'Startup Cost')::numeric),
+        min((d.a->>'Temp Read Blocks')::bigint),max((d.a->>'Temp Read Blocks')::bigint),
+        min((d.a->>'Temp Written Blocks')::bigint),max((d.a->>'Temp Written Blocks')::bigint)
+    FROM d GROUP BY d.case_name,d.variant ORDER BY d.case_name,d.variant;
+END $$;
+
+-- Build the entire reference array before slicing: no bounded reference sort.
+CREATE FUNCTION sortbench_slots_assert(actual text[], representation text,
+    result_rows integer, offset_rows integer DEFAULT 0)
+RETURNS text LANGUAGE plpgsql AS $$
+DECLARE expected text[];
+BEGIN
+    IF representation NOT IN ('datum','tuple','nulls-first','nulls-last') OR
+       result_rows<1 OR offset_rows<0 OR result_rows+offset_rows>8193 THEN
+        RAISE EXCEPTION 'Invalid slots correctness manifest';
+    END IF;
+    IF representation IN ('datum','tuple') THEN
+        SELECT array_agg(CASE WHEN representation='datum' THEN g::text
+                             ELSE ROW(g,-g)::text END ORDER BY g)
+        INTO expected FROM generate_series(0,8192) g;
+    ELSIF representation='nulls-first' THEN
+        SELECT array_agg(ROW(k,g)::text ORDER BY k NULLS FIRST,g) INTO expected
+        FROM (SELECT g,CASE WHEN g%37=0 THEN NULL ELSE g%101 END AS k
+              FROM generate_series(0,8192) g) q;
+    ELSE
+        SELECT array_agg(ROW(k,g)::text ORDER BY k NULLS LAST,g) INTO expected
+        FROM (SELECT g,CASE WHEN g%37=0 THEN NULL ELSE g%101 END AS k
+              FROM generate_series(0,8192) g) q;
+    END IF;
+    IF actual IS DISTINCT FROM expected[offset_rows+1:offset_rows+result_rows] THEN
+        RAISE EXCEPTION 'Wrong ordered result: representation=%, limit=%, offset=%, slots=%',
+            representation,result_rows,offset_rows,current_setting('debug_sort_heap_on_slots');
+    END IF;
+    RETURN format('OK: %s ordered values, offset %s',result_rows,offset_rows);
+END $$;
+
+CREATE FUNCTION sortbench_slots_expected() RETURNS TABLE(
+    case_name text, variant text, kind text, batch integer, check_name text)
+LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN QUERY
+    WITH v AS (
+        SELECT m.name,x.v FROM pg_temp.sortbench_slots_cases m
+        CROSS JOIN LATERAL unnest(m.variants) AS x(v)
+    )
+    SELECT v.name,v.v,'warmup'::text,1,'slots-matrix'::text FROM v
+    UNION ALL
+    SELECT v.name,v.v,'timed',b.n,'slots-matrix' FROM v CROSS JOIN generate_series(1,4) b(n)
+    UNION ALL
+    SELECT v.name||'/trace',v.v,'diagnostic',1,'slots-trace' FROM v
+    UNION ALL
+    SELECT m.name,x.v,'diagnostic',1,'slots-small' FROM pg_temp.sortbench_slots_small m
+    CROSS JOIN (VALUES ('off/default'::text),('on/default')) x(v);
+END $$;
+
+CREATE FUNCTION sortbench_slots_check() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE c record; s record; a jsonb; p jsonb; first_plan jsonb; first_settings jsonb;
+        total_count integer; changed_count integer;
+BEGIN
+    PERFORM sortbench_file_ready();
+    SELECT count(*)::integer INTO total_count FROM sortbench_slots_expected();
+    IF EXISTS (
+        WITH actual AS (
+            SELECT f.case_name,f.variant,f.kind,f.batch,f.check_name,count(*) AS n
+            FROM pg_temp.sortbench_file_samples f GROUP BY 1,2,3,4,5
+        )
+        SELECT FROM sortbench_slots_expected() e FULL JOIN actual a
+        USING(case_name,variant,kind,batch,check_name)
+        WHERE e.case_name IS NULL OR a.n IS DISTINCT FROM 1::bigint
+    ) THEN RAISE EXCEPTION 'Slots capture does not match manifest: missing/duplicate/unknown samples'; END IF;
+
+    FOR c IN
+        SELECT m.name,m.mem,m.k,0 AS offset_rows,1000000 AS input_rows,
+               'sortbench_data'::text AS relation_name,2 AS ncols,1 AS nkeys
+        FROM pg_temp.sortbench_slots_cases m
+        UNION ALL
+        SELECT m.name,'128kB',m.k,m.offset_rows,8193,m.relation_name,
+               CASE WHEN m.representation='datum' THEN 1 ELSE 2 END,m.nkeys
+        FROM pg_temp.sortbench_slots_small m
+    LOOP
+        first_plan := NULL; first_settings := NULL;
+        FOR s IN SELECT * FROM pg_temp.sortbench_file_samples f
+                 WHERE f.case_name=c.name OR f.case_name=c.name||'/trace' LOOP
+            p := sortbench_file_estimate(s.plan#>'{0,Plan}');
+            IF first_plan IS NOT NULL AND p IS DISTINCT FROM first_plan THEN
+                RAISE EXCEPTION 'Planner fields changed within slots case: %',c.name;
+            END IF;
+            first_plan := p;
+            p := s.settings - 'debug_sort_heap_on_slots' - 'debug_disable_sort_bounded'
+                            - 'debug_disable_sort_radix' - 'trace_sort';
+            IF first_settings IS NOT NULL AND p IS DISTINCT FROM first_settings THEN
+                RAISE EXCEPTION 'Other settings changed within slots case: %',c.name;
+            END IF;
+            first_settings := p;
+            a := s.plan#>'{0,Plan,Plans,0}';
+            IF s.plan#>>'{0,Plan,Node Type}' IS DISTINCT FROM 'Limit'
+               OR (s.plan#>>'{0,Plan,Actual Rows}')::numeric IS DISTINCT FROM c.k
+               OR (s.plan#>>'{0,Plan,Plan Rows}')::numeric IS DISTINCT FROM c.k
+               OR (s.plan#>>'{0,Plan,Actual Loops}')::numeric IS DISTINCT FROM 1
+               OR a->>'Node Type' IS DISTINCT FROM 'Sort'
+               OR (a->>'Actual Rows')::numeric IS DISTINCT FROM c.k+c.offset_rows
+               OR (a->>'Actual Loops')::numeric IS DISTINCT FROM 1
+               OR jsonb_array_length(a->'Sort Key') IS DISTINCT FROM c.nkeys
+               OR a#>>'{Plans,0,Node Type}' IS DISTINCT FROM 'Seq Scan'
+               OR a#>>'{Plans,0,Relation Name}' IS DISTINCT FROM c.relation_name
+               OR (a#>>'{Plans,0,Actual Rows}')::numeric IS DISTINCT FROM c.input_rows
+               OR (a#>>'{Plans,0,Plan Rows}')::numeric IS DISTINCT FROM c.input_rows
+               OR (a#>>'{Plans,0,Actual Loops}')::numeric IS DISTINCT FROM 1
+               OR jsonb_array_length(a#>'{Plans,0,Output}') IS DISTINCT FROM c.ncols
+               OR coalesce(a->>'Sort Method','') NOT IN
+                   ('top-N heapsort','quicksort','external sort','external merge')
+               OR coalesce(a->>'Sort Space Type','') NOT IN ('Memory','Disk') THEN
+                RAISE EXCEPTION 'Unexpected slots plan shape: %/%',s.case_name,s.variant;
+            END IF;
+            IF s.settings->>'debug_sort_heap_on_slots' IS DISTINCT FROM split_part(s.variant,'/',1)
+               OR s.settings->>'debug_sort_free_heap_root' IS DISTINCT FROM 'on'
+               OR s.settings->>'debug_disable_sort_bounded' IS DISTINCT FROM
+                   (CASE WHEN split_part(s.variant,'/',2)='no-heap' THEN 'on' ELSE 'off' END)
+               OR s.settings->>'debug_disable_sort_radix' IS DISTINCT FROM
+                   (CASE WHEN split_part(s.variant,'/',2)='no-radix' THEN 'on' ELSE 'off' END)
+               OR s.settings->>'trace_sort' IS DISTINCT FROM
+                   (CASE WHEN s.check_name='slots-trace' THEN 'on' ELSE 'off' END)
+               OR s.settings->>'max_parallel_workers_per_gather' IS DISTINCT FROM '0'
+               OR s.settings->>'max_parallel_workers' IS DISTINCT FROM '0'
+               OR s.settings->>'jit' IS DISTINCT FROM 'off'
+               OR s.settings->>'synchronize_seqscans' IS DISTINCT FROM 'off'
+               OR pg_size_bytes(s.settings->>'work_mem') IS DISTINCT FROM pg_size_bytes(c.mem)
+               OR (split_part(s.variant,'/',2)='no-heap' AND a->>'Sort Method'='top-N heapsort') THEN
+                RAISE EXCEPTION 'Unexpected slots settings/method: %/%',s.case_name,s.variant;
+            END IF;
+        END LOOP;
+    END LOOP;
+    -- A negative control: the new switch must not bypass disable-bounded.
+    IF EXISTS (
+        SELECT FROM pg_temp.sortbench_file_samples a
+        JOIN pg_temp.sortbench_file_samples b
+          ON b.case_name=a.case_name AND b.kind=a.kind AND b.batch=a.batch
+         AND b.variant='off/no-heap'
+        WHERE a.variant='on/no-heap' AND
+          a.plan#>>'{0,Plan,Plans,0,Sort Method}' IS DISTINCT FROM
+          b.plan#>>'{0,Plan,Plans,0,Sort Method}'
+    ) THEN RAISE EXCEPTION 'Slots switch changed the disabled-heap control method'; END IF;
+    SELECT count(DISTINCT a.case_name)::integer INTO changed_count
+    FROM pg_temp.sortbench_file_samples a JOIN pg_temp.sortbench_file_samples b
+      ON b.case_name=a.case_name AND b.kind=a.kind AND b.batch=a.batch AND b.variant='off/default'
+    WHERE a.variant='on/default' AND a.kind='timed'
+      AND a.plan#>>'{0,Plan,Plans,0,Sort Method}'='top-N heapsort'
+      AND b.plan#>>'{0,Plan,Plans,0,Sort Space Type}'='Disk';
+    IF changed_count=0 THEN
+        RAISE EXCEPTION 'No disk-to-heap transition exercised; inspect trace and binary/fixture';
+    END IF;
+    RETURN format('OK: %s plans; %s default cases changed from disk to heap',total_count,changed_count);
+END $$;
+
+CREATE FUNCTION sortbench_slots_ratios() RETURNS TABLE(
+    case_name text, strategy text, paired_batches bigint, median_ratio numeric,
+    min_ratio numeric, max_ratio numeric, faster_batches bigint, slower_batches bigint)
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM sortbench_slots_check();
+    RETURN QUERY
+    WITH r AS (
+        SELECT a.case_name,split_part(a.variant,'/',2) AS strategy,a.ms/b.ms AS ratio
+        FROM pg_temp.sortbench_file_batches a JOIN pg_temp.sortbench_file_batches b
+          ON a.case_name=b.case_name AND a.batch=b.batch
+         AND b.variant='off/'||split_part(a.variant,'/',2)
+        WHERE split_part(a.variant,'/',1)='on' AND a.n=1 AND b.n=1 AND b.ms>0
+    )
+    SELECT r.case_name,r.strategy,count(*),
+        round((percentile_cont(0.5) WITHIN GROUP (ORDER BY r.ratio))::numeric,3),
+        round(min(r.ratio)::numeric,3),round(max(r.ratio)::numeric,3),
+        count(*) FILTER (WHERE r.ratio<0.95),count(*) FILTER (WHERE r.ratio>1.05)
+    FROM r GROUP BY r.case_name,r.strategy ORDER BY r.case_name,r.strategy;
 END $$;

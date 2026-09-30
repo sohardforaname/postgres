@@ -762,6 +762,14 @@
   boot_val => 'false',
 },
 
+{ name => 'debug_sort_heap_on_slots', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Allows bounded heapsort when the tuple array is full, for A/B tests.',
+  long_desc => 'Requires more tuples than the bound. Off preserves the previous switching conditions. Does not change planner costs.',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_EXPLAIN',
+  variable => 'debug_sort_heap_on_slots',
+  boot_val => 'false',
+},
+
 { name => 'debug_write_read_parse_plan_trees', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Set this to force all parse and plan trees to be passed through outfuncs.c/readfuncs.c, to facilitate catching errors and omissions in those modules.',
   flags => 'GUC_NOT_IN_SAMPLE',

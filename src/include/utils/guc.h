@@ -330,6 +330,7 @@ extern PGDLLIMPORT bool trace_sort;
 extern PGDLLIMPORT bool debug_disable_sort_bounded;
 extern PGDLLIMPORT bool debug_disable_sort_radix;
 extern PGDLLIMPORT bool debug_sort_free_heap_root;
+extern PGDLLIMPORT bool debug_sort_heap_on_slots;
 
 #ifdef DEBUG_BOUNDED_SORT
 extern PGDLLIMPORT bool optimize_bounded_sort;

@@ -125,6 +125,7 @@ bool		trace_sort = false;
 bool		debug_disable_sort_bounded = false;
 bool		debug_disable_sort_radix = false;
 bool		debug_sort_free_heap_root = false;
+bool		debug_sort_heap_on_slots = false;
 
 #ifdef DEBUG_BOUNDED_SORT
 bool		optimize_bounded_sort = true;
@@ -1070,16 +1071,46 @@ tuplesort_trace_memory(Tuplesortstate *state, const char *phase)
 {
 	int64		array_bytes = GetMemoryChunkSpace(state->memtuples);
 	int64		used_bytes = state->allowedMem - state->availMem;
+	bool		count_trigger = state->bounded &&
+		(int64) state->memtupcount > (int64) state->bound * 2;
+	bool		memory_trigger = state->bounded &&
+		state->memtupcount > state->bound && LACKMEM(state);
+	bool		slots_full = state->memtupcount >= state->memtupsize;
+	bool		slots_trigger = state->bounded && debug_sort_heap_on_slots &&
+		state->memtupcount > state->bound && slots_full;
+	const char *reason;
 
+	/* Evaluate the existing predicates; do not change the decision itself. */
+	if (strcmp(phase, "heap-input") == 0)
+		reason = count_trigger ? (memory_trigger ? "count-and-memory" : "count") :
+			(memory_trigger ? "memory" : "slots");
+	else if (strcmp(phase, "external-input") == 0)
+		reason = slots_full ? (LACKMEM(state) ? "slots-and-memory" : "slots") :
+			"memory";
+	else if (strcmp(phase, "heap-ready") == 0)
+		reason = "heap-built";
+	else
+		reason = "input-end";
+
+	/* tupleMem is not decremented by individual free_sort_tuple() calls. */
 	Assert(!state->slabAllocatorUsed);
 	elog(LOG, "sortbench memory: phase=%s tuples=%d bound=%d capacity=%d "
 		 "slots_full=%d memory_full=%d allowed_bytes=" INT64_FORMAT
 		 " accounted_bytes=" INT64_FORMAT " array_bytes=" INT64_FORMAT
-		 " tuple_bytes=" INT64_FORMAT,
+		 " tuple_bytes=" INT64_FORMAT " reason=%s bounded=%d heap_enabled=%d "
+		 "count_trigger=%d memory_trigger=%d slots_trigger=%d "
+		 "slots_heap_enabled=%d grow_allowed=%d "
+		 "avail_bytes=" INT64_FORMAT " sorttuple_bytes=%zu "
+		 "array_payload_bytes=" INT64_FORMAT " tuple_mem_counter=" INT64_FORMAT,
 		 phase, state->memtupcount, state->bounded ? state->bound : -1,
-		 state->memtupsize, state->memtupcount >= state->memtupsize,
+		 state->memtupsize, slots_full,
 		 LACKMEM(state), state->allowedMem, used_bytes, array_bytes,
-		 used_bytes - array_bytes);
+		 used_bytes - array_bytes, reason, state->bounded,
+		 state->bounded && !debug_disable_sort_bounded,
+		 count_trigger, memory_trigger, slots_trigger,
+		 debug_sort_heap_on_slots, state->growmemtuples,
+		 state->availMem, sizeof(SortTuple),
+		 (int64) state->memtupsize * sizeof(SortTuple), state->tupleMem);
 }
 
 /*
@@ -1141,7 +1172,17 @@ tuplesort_puttuple_common(Tuplesortstate *state, SortTuple *tuple,
 			 */
 			if (state->memtupcount >= state->memtupsize - 1)
 			{
-				(void) grow_memtuples(state);
+				int			old_capacity = state->memtupsize;
+				bool		could_grow = state->growmemtuples;
+				bool		grew = grow_memtuples(state);
+
+				/* Only the final growth and failed attempts need a trace. */
+				if (trace_sort && (!state->growmemtuples || !grew))
+					elog(LOG, "sortbench grow: stored_tuples=%d pending_tuple_bytes=%zu "
+						 "old_capacity=%d new_capacity=%d could_grow=%d grew=%d "
+						 "grow_allowed=%d avail_bytes=" INT64_FORMAT,
+						 state->memtupcount, tuplen, old_capacity, state->memtupsize,
+						 could_grow, grew, state->growmemtuples, state->availMem);
 				Assert(state->memtupcount < state->memtupsize);
 			}
 			state->memtuples[state->memtupcount++] = *tuple;
@@ -1151,7 +1192,10 @@ tuplesort_puttuple_common(Tuplesortstate *state, SortTuple *tuple,
 			 * so if the input tuple count exceeds twice the desired tuple
 			 * count (this is a heuristic for where heapsort becomes cheaper
 			 * than a quicksort), or if we've just filled workMem and have
-			 * enough tuples to meet the bound.
+			 * enough tuples to meet the bound.  The temporary A/B switch also
+			 * permits this when the array is full: otherwise we must spill
+			 * even if a few accounted bytes remain.  Keep the strict > bound
+			 * check so that building the heap actually discards input tuples.
 			 *
 			 * Note that once we enter TSS_BOUNDED state we will always try to
 			 * complete the sort that way.  In the worst case, if later input
@@ -1160,7 +1204,10 @@ tuplesort_puttuple_common(Tuplesortstate *state, SortTuple *tuple,
 			 */
 			if (state->bounded && !debug_disable_sort_bounded &&
 				(state->memtupcount > state->bound * 2 ||
-				 (state->memtupcount > state->bound && LACKMEM(state))))
+				 (state->memtupcount > state->bound &&
+				  (LACKMEM(state) ||
+				   (debug_sort_heap_on_slots &&
+					state->memtupcount >= state->memtupsize)))))
 			{
 				if (trace_sort)
 					elog(LOG, "switching to bounded heapsort at %d tuples: %s",
